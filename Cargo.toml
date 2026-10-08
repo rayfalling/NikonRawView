@@ -1,0 +1,20 @@
+[package]
+name = "nikonrawview"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "解析尼康 Picture Control 配方：从 NEF/JPEG 读配方身份，从 NP3/NCP 容器读配方本体"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nikonrawview"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nikon-pc"
+path = "src/main.rs"
+
+# 解析层零依赖：TIFF/IFD 与 NP3 chunk 遍历均自行实现。
+# 见 openspec/changes/add-picture-control-parsing/design.md 决策七、决策八。
+[dependencies]
