@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------
+# 样张与素材：体积大且涉及个人照片，一律不入库。
+# 需要入库的文档配图请用 PNG，或对单个文件用 git add -f 强制添加。
+# ---------------------------------------------------------------
+samples/
+*.NEF
+*.nef
+*.NRW
+*.nrw
+*.JPG
+*.jpg
+*.JPEG
+*.jpeg
+*.TIF
+*.tif
+*.DNG
+*.dng
+*.CR2
+*.cr2
+*.ARW
+*.arw
+
+# Lightroom / 后期工程的副产物
+*.lrcat
+*.lrcat-data
+*.lrcat.lock
+Lightroom Catalog*/
+*.xmp
+*.dop
+
+# 生成结果
+out/
+build/
+dist/
+
+# ---------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.env
+.python-version
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------
+# 编辑器 / 操作系统
+# ---------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# 日志与临时文件
+*.log
+tmp/
+temp/
