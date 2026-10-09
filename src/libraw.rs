@@ -13,7 +13,7 @@
 //!
 //! LibRaw 为 CDDL-1.0。源码随仓库分发于 `third_party/libraw/`，由 `build.rs` 构建。
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::Path;
 
@@ -27,7 +27,15 @@ pub type Handle = *mut c_void;
 extern "C" {
     fn libraw_init(flags: c_uint) -> Handle;
     fn libraw_close(lr: Handle);
+    /// 窄字符入口。Windows 上改用 `libraw_open_wfile`，故此处仅在非 Windows 使用。
+    #[allow(dead_code)]
     fn libraw_open_file(lr: Handle, fname: *const c_char) -> c_int;
+    /// Windows 专用：宽字符路径。
+    ///
+    /// `libraw_open_file` 收的是 `const char*`，在 Windows 上按 ANSI 代码页解释，
+    /// **含中文的路径一律打不开**。本项目的照片库路径普遍含中文，因此 Windows 上
+    /// 必须走这个入口。
+    fn libraw_open_wfile(lr: Handle, fname: *const u16) -> c_int;
     fn libraw_unpack(lr: Handle) -> c_int;
     fn libraw_dcraw_process(lr: Handle) -> c_int;
     fn libraw_dcraw_make_mem_image(lr: Handle, errc: *mut c_int) -> *mut ProcessedImage;
@@ -176,6 +184,26 @@ fn check(code: c_int) -> Result<()> {
     }
 }
 
+/// 打开一个 RAW 文件。
+///
+/// Windows 上走宽字符入口：`libraw_open_file` 按 ANSI 代码页解释路径，
+/// 而本项目的照片库路径含中文（如 `Z:\摄影\Nikon\Z8\...`），用窄字符入口
+/// 会一个文件都打不开。
+#[cfg(windows)]
+fn open_raw(lr: Handle, path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    unsafe { check(libraw_open_wfile(lr, wide.as_ptr())) }
+}
+
+#[cfg(not(windows))]
+fn open_raw(lr: Handle, path: &Path) -> Result<()> {
+    let c = CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|_| Error::BadPath(path.display().to_string()))?;
+    unsafe { check(libraw_open_file(lr, c.as_ptr())) }
+}
+
 /// LibRaw 的版本号，形如 `0x001600`。
 pub fn version_number() -> i32 {
     unsafe { libraw_version_number() }
@@ -288,8 +316,6 @@ fn decode_with_output(path: &Path, opts: &Options, output: OutputColor) -> Resul
     if !path.is_file() {
         return Err(Error::Io(format!("文件不存在：{}", path.display())));
     }
-    let cpath = CString::new(path.to_string_lossy().as_bytes())
-        .map_err(|_| Error::BadPath(path.display().to_string()))?;
 
     let session = Session(unsafe { libraw_init(0) });
     if session.0.is_null() {
@@ -298,7 +324,7 @@ fn decode_with_output(path: &Path, opts: &Options, output: OutputColor) -> Resul
     let lr = session.0;
 
     unsafe {
-        check(libraw_open_file(lr, cpath.as_ptr()))?;
+        open_raw(lr, path)?;
         check(libraw_unpack(lr))?;
 
         if let Some(m) = opts.user_mul {
@@ -373,15 +399,13 @@ pub fn read_wb(path: &Path) -> Result<[f32; 3]> {
     if !path.is_file() {
         return Err(Error::Io(format!("文件不存在：{}", path.display())));
     }
-    let cpath = CString::new(path.to_string_lossy().as_bytes())
-        .map_err(|_| Error::BadPath(path.display().to_string()))?;
     let session = Session(unsafe { libraw_init(0) });
     if session.0.is_null() {
         return Err(Error::NoHandle);
     }
     let lr = session.0;
     unsafe {
-        check(libraw_open_file(lr, cpath.as_ptr()))?;
+        open_raw(lr, path)?;
         check(libraw_unpack(lr))?;
         Ok([
             libraw_get_cam_mul(lr, 0),

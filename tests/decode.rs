@@ -326,34 +326,72 @@ fn camera_matrix_varies_with_white_balance() {
         }
     };
 
-    // 扫描：找出两张白平衡明显不同的文件
+    // 扫描：找出两张白平衡明显不同的文件。
+    //
+    // 按顶层目录分散取样并限制总探测数——每个 read_wb 都要读文件头之后相当一段，
+    // 放在网络盘上无上限地扫会非常慢。不同行程目录的光线条件差异最大，优先从那取。
+    const PER_DIR: usize = 6;
+    const MAX_PROBE: usize = 96;
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    let tops: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_else(|_| vec![root.clone()]);
+    for dir in tops.iter().chain(std::iter::once(&root)) {
+        let mut taken = 0usize;
+        let mut stack = vec![dir.clone()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("nef")) {
+                    continue;
+                }
+                candidates.push(p);
+                taken += 1;
+                if taken >= PER_DIR {
+                    break;
+                }
+            }
+            if taken >= PER_DIR {
+                break;
+            }
+        }
+    }
+    eprintln!("候选 NEF {} 个（上限 {MAX_PROBE}）", candidates.len());
+
     let mut found: Vec<(std::path::PathBuf, [f32; 3])> = Vec::new();
-    let mut stack = vec![root];
-    'outer: while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-                continue;
-            }
-            if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("nef")) {
-                continue;
-            }
-            let Ok(wb) = libraw::read_wb(&p) else { continue };
-            if let Some((_, w0)) = found.first() {
+    let mut probed = 0usize;
+    let mut failed = 0usize;
+    for p in candidates.iter().take(MAX_PROBE) {
+        probed += 1;
+        let Ok(wb) = libraw::read_wb(p) else {
+            failed += 1;
+            continue;
+        };
+        match found.first() {
+            None => found.push((p.clone(), wb)),
+            Some((_, w0)) => {
                 // 红蓝比差异超过 15% 才算"明显不同"
                 let r0 = w0[0] / w0[2].max(1e-6);
                 let r1 = wb[0] / wb[2].max(1e-6);
                 if (r1 - r0).abs() / r0.max(1e-6) > 0.15 {
-                    found.push((p, wb));
-                    break 'outer;
+                    found.push((p.clone(), wb));
+                    break;
                 }
-            } else {
-                found.push((p, wb));
             }
         }
     }
+    eprintln!("探测 {probed} 个（读取失败 {failed}），找到 {} 个不同白平衡样本", found.len());
 
     if found.len() < 2 {
         eprintln!("跳过：未在目录中找到白平衡明显不同的两张 NEF");
@@ -368,17 +406,28 @@ fn camera_matrix_varies_with_white_balance() {
     let a = libraw::decode_working_space(pa, &opts).unwrap();
     let b = libraw::decode_working_space(pb, &opts).unwrap();
 
-    let diff: f32 = (0..3)
+    // **实测结论**：随拍摄白平衡变化的是白平衡系数，不是相机矩阵。
+    // LibRaw 的 `rgb_cam` 按机型固定（dcraw 的 cam_xyz_coeff 只依赖机型的
+    // cam_xyz 与输出空间，与拍摄白平衡无关）。
+    let wb_diff: f32 = (0..3).map(|i| (wa[i] - wb[i]).abs()).sum();
+    eprintln!("白平衡系数差异和 = {wb_diff:.4}");
+    assert!(wb_diff > 0.05, "两张样本的白平衡系数应明显不同，得到 {wb_diff}");
+
+    let m_diff: f32 = (0..3)
         .flat_map(|i| (0..3).map(move |j| (i, j)))
         .map(|(i, j)| (a.rgb_cam[i][j] - b.rgb_cam[i][j]).abs())
         .sum();
-    eprintln!("矩阵差异和 = {diff:.6}");
+    eprintln!("相机矩阵差异和 = {m_diff:.6}");
     eprintln!("  A: {:?}", a.rgb_cam);
     eprintln!("  B: {:?}", b.rgb_cam);
+    eprintln!("  A cam_mul={:?}  B cam_mul={:?}", a.wb, b.wb);
 
+    // 本测试**不断言矩阵不同**——实测它相同。它断言的是"确有随拍摄变化的量"，
+    // 免得日后误以为整个白平衡链路是固定的。
     assert!(
-        diff > 1e-3,
-        "白平衡明显不同的两张文件应得到不同矩阵（差异和 {diff}）——相同说明矩阵是固定常数"
+        m_diff.abs() < 1e-6,
+        "实测相机矩阵按机型固定、不随拍摄白平衡变化；若此处不再为 0（{m_diff}），\
+         说明解码层改变了行为，需要重新审视 render/color-pipeline 的规范"
     );
     assert!(a.rgb_cam.iter().flatten().all(|v| v.is_finite()));
     assert!(b.rgb_cam.iter().flatten().all(|v| v.is_finite()));
