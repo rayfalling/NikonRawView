@@ -91,8 +91,11 @@ impl GradingF {
             // 色相以 1/10 度存储，取模到 −180..180
             hue: {
                 let deg = hue_raw as f32 / 10.0;
-                let deg = if deg > 180.0 { deg - 360.0 } else { deg };
-                deg
+                if deg > 180.0 {
+                    deg - 360.0
+                } else {
+                    deg
+                }
             },
             chroma: chroma as f32 * BAND_SCALE,
             brightness: brightness as f32 * BAND_SCALE,
@@ -538,8 +541,8 @@ mod tests {
     fn non_monotonic_curve_is_applied_verbatim() {
         // 构造一条非单调曲线：先上后下
         let mut lut: Vec<f32> = (0..257).map(|i| i as f32 / 256.0).collect();
-        for i in 128..257 {
-            lut[i] = 0.5 - (i - 128) as f32 / 256.0;
+        for (i, v) in lut.iter_mut().enumerate().skip(128) {
+            *v = 0.5 - (i - 128) as f32 / 256.0;
         }
         let mut t = default_t();
         t.curve = Some(lut.clone());
