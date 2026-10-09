@@ -391,6 +391,29 @@ fn decode_with_output(path: &Path, opts: &Options, output: OutputColor) -> Resul
     }
 }
 
+/// 只读出有效像素尺寸，不做去马赛克与色彩转换。
+///
+/// 用于校验参考导出是否与原始文件同源——完整解码一张 45 MP 的 NEF 要十几秒，
+/// 而尺寸在 `unpack` 之后即可取得。
+pub fn read_dimensions(path: &Path) -> Result<(usize, usize)> {
+    if !path.is_file() {
+        return Err(Error::Io(format!("文件不存在：{}", path.display())));
+    }
+    let session = Session(unsafe { libraw_init(0) });
+    if session.0.is_null() {
+        return Err(Error::NoHandle);
+    }
+    let lr = session.0;
+    unsafe {
+        open_raw(lr, path)?;
+        check(libraw_unpack(lr))?;
+        Ok((
+            libraw_get_raw_width(lr).max(0) as usize,
+            libraw_get_raw_height(lr).max(0) as usize,
+        ))
+    }
+}
+
 /// 只读出白平衡系数，不做去马赛克与色彩转换。
 ///
 /// 用于快速扫描一批文件找出白平衡不同的样本——完整解码一张 45 MP 的 NEF 要十几秒，

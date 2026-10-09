@@ -433,7 +433,37 @@ fn camera_matrix_varies_with_white_balance() {
     assert!(b.rgb_cam.iter().flatten().all(|v| v.is_finite()));
 }
 
-/// 路线 B 的验证：相机矩阵能否**测**出来，并在另一张图上成立。
+/// 5.1 在真实样本上的验证：`DSC_4143` 的 ADL 是「标准」而非关闭，
+/// 因此它**必须**被拒绝作为参考导出——这正是校验要拦住的第一种情况。
+#[test]
+fn real_sample_is_rejected_as_reference_because_adl_is_on() {
+    let raw = samples_dir().join("DSC_4143.NEF");
+    if !raw.is_file() {
+        eprintln!("跳过：未找到 {}", raw.display());
+        return;
+    }
+    let data = std::fs::read(&raw).unwrap();
+
+    let adl = nikonrawview::makernote::active_d_lighting(&data)
+        .expect("应能读出 ADL")
+        .expect("样本应含 ADL 标签");
+    eprintln!("DSC_4143 的 ADL = {}", adl.name());
+    assert!(!adl.is_off(), "该样本的 ADL 应为开启状态");
+
+    // 直接走校验：ADL 未关 → 该对被排除
+    let mut set = nikonrawview::calibrate::ReferenceSet::default();
+    set.pairs.push(nikonrawview::calibrate::ReferencePair {
+        raw: raw.clone(),
+        export: raw.clone(), // 导出用同一个文件占位，重点是 ADL 那一项
+    });
+    let reports = nikonrawview::calibrate::validate(&set);
+    assert_eq!(reports.len(), 1);
+    let r = &reports[0];
+    let joined: String = r.issues.iter().map(|i| i.describe()).collect::<Vec<_>>().join(" | ");
+    eprintln!("校验结论：{joined}");
+    assert!(!r.is_ok(), "ADL 未关闭的样本必须被排除，却通过了校验");
+    assert!(joined.contains("ADL 未关闭"), "应指出 ADL 问题：{joined}");
+}
 ///
 /// 前提来自 3.1 的实测——矩阵按机型固定、不随拍摄白平衡变化，所以每个机型只需测一次。
 /// 若本测试通过，`render/color-pipeline` 就可以保留「由本管线施加矩阵」，同时拿回
