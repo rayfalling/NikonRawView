@@ -29,6 +29,43 @@ impl Margins {
     }
 }
 
+/// 一条相机 → 工作空间的线性色彩矩阵，连同它的适用条件与来源。
+///
+/// # 为什么矩阵要存在这里，而不是向解码层索要
+///
+/// 解码层有一个「相机 → 输出空间」的访问接口（`libraw_get_rgb_cam`），但它返回的
+/// 矩阵**与输出色彩空间无关**——实测把输出分别设为 Camera / sRGB / ProPhoto，该接口
+/// 给出的矩阵**逐位相同**，而像素两两平均绝对差达 254.7–550.5（16 位刻度）。也就是
+/// 说那不是实际参与转换的矩阵。
+///
+/// 因此本项目的做法是**测**出来：用同一文件在「相机空间」与「工作空间」两种输出下
+/// 的配对做最小二乘（见 [`crate::color::derive_matrix`]）。实测残差落在 1e-5 量级，
+/// 且**换一张照片复验仍然成立**（6,348,068 样本，平均绝对差 0.000007）——这同时证明
+/// 矩阵按机型固定，所以每个机型只需测一次。
+#[derive(Debug, Clone, Copy)]
+pub struct ColorMatrixEntry {
+    /// 行主序 3×3。
+    pub matrix: [[f32; 3]; 3],
+    /// 该矩阵的目的空间。
+    pub output_space: &'static str,
+    /// 推导来源——含所用参考照片与残差，便于复核与再现。
+    pub source: &'static str,
+}
+
+impl ColorMatrixEntry {
+    /// 各行之和。相机矩阵把中性映射为中性时，三者都应接近 1.0。
+    ///
+    /// 注意这只是**必要条件而非充分条件**：实测正确的矩阵与解码层给的那个错矩阵
+    /// 行和都是 1.0，仅凭这一条分辨不出真假。真正的判据是跨图复验的残差。
+    pub fn row_sums(&self) -> [f32; 3] {
+        let mut out = [0f32; 3];
+        for (i, row) in self.matrix.iter().enumerate() {
+            out[i] = row.iter().sum();
+        }
+        out
+    }
+}
+
 /// 一条机型记录。
 #[derive(Debug, Clone, Copy)]
 pub struct Model {
@@ -39,6 +76,8 @@ pub struct Model {
     pub margins: Margins,
     /// 该条边距的来源依据——便于日后复核，也避免"数字从哪来的"变成谜。
     pub source: &'static str,
+    /// 相机 → 工作空间的色彩矩阵；未标定时为 `None`。
+    pub color_matrix: Option<ColorMatrixEntry>,
 }
 
 /// 已知机型表。
@@ -51,6 +90,18 @@ pub const MODELS: &[Model] = &[Model {
     margins: Margins { left: 12, top: 8, right: 12, bottom: 8 },
     source: "实测：LibRaw 输出传感器全幅 8280×5520，尼康工坊导出为 8256×5504，\
              差值左右各 12、上下各 8；与独立实现 rawler 报的裁切区 @(12,8) 吻合",
+    color_matrix: Some(ColorMatrixEntry {
+        matrix: [
+            [0.688_90, 0.328_61, -0.017_58],
+            [0.017_33, 1.261_10, -0.278_49],
+            [-0.014_57, -0.107_67, 1.122_18],
+        ],
+        output_space: "ProPhoto 线性",
+        source: "配对最小二乘推导。参考照片 simple/DSC_4143.NEF：6,529,215 个样本，\
+                 rms 0.000005；跨图复验 DSC_3307.NEF：6,348,068 个样本，\
+                 平均绝对差 0.000007、最大 0.000025。\
+                 样本已排除任一侧饱和点（那里解码层做过裁切）",
+    }),
 }];
 
 /// 把机型字符串规范化以便匹配：转小写、把连续空白折成单个空格、去首尾空白。
@@ -187,6 +238,14 @@ pub fn read_model(path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// 按机型取相机 → 工作空间的色彩矩阵。
+///
+/// 未标定的机型返回 `None`——**不得用别的机型的矩阵顶替**，也不得退回解码层那个
+/// 实测有误的矩阵。
+pub fn color_matrix(model: &str) -> Option<&'static ColorMatrixEntry> {
+    lookup(model).and_then(|m| m.color_matrix.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +323,40 @@ mod tests {
     fn every_model_entry_has_a_source() {
         for m in MODELS {
             assert!(!m.source.trim().is_empty(), "{} 缺少边距来源依据", m.display);
+            if let Some(cm) = &m.color_matrix {
+                assert!(!cm.source.trim().is_empty(), "{} 缺少矩阵来源依据", m.display);
+                assert!(!cm.output_space.trim().is_empty(), "{} 未标注矩阵的目的空间", m.display);
+            }
         }
+    }
+
+    #[test]
+    fn z8_color_matrix_maps_neutral_to_neutral() {
+        let cm = color_matrix("NIKON Z 8").expect("Z8 应有色彩矩阵");
+        for (i, s) in cm.row_sums().iter().enumerate() {
+            assert!(
+                (s - 1.0).abs() < 1e-3,
+                "第 {i} 行行和为 {s}，中性应被映射为中性"
+            );
+        }
+    }
+
+    #[test]
+    fn color_matrix_is_not_the_decoder_one() {
+        // 回归：解码层 libraw_get_rgb_cam 给出的矩阵与输出空间无关，不是实际使用的那个。
+        // 若有人图省事换成它，这里会失败。
+        let cm = color_matrix("NIKON Z 8").unwrap();
+        let decoder_first_row = [1.393_10f32, -0.215_69, -0.177_41];
+        let d: f32 = (0..3).map(|j| (cm.matrix[0][j] - decoder_first_row[j]).abs()).sum();
+        assert!(
+            d > 0.5,
+            "矩阵第 0 行与解码层给出的过于接近（差 {d}）——那一个实测不是实际使用的矩阵"
+        );
+    }
+
+    #[test]
+    fn uncalibrated_model_returns_no_matrix() {
+        assert!(color_matrix("Canon EOS R5").is_none());
+        assert!(color_matrix("").is_none());
     }
 }

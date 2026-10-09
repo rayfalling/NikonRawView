@@ -657,7 +657,7 @@ fn color_pipeline_matches_decoder_working_space() {
         //
         // 解码层的内部转换会对超出色域的分量做裁切与去饱和，而本管线刻意不做
         // ——那是设计差异，不是误差。把它算进统计只会掩盖真实的一致性。
-        if ours.iter().any(|v| !(0.0f32..=1.0).contains(v)) || w.iter().any(|v| *v == u16::MAX) {
+        if ours.iter().any(|v| !(0.0f32..=1.0).contains(v)) || w.contains(&u16::MAX) {
             skipped += 1;
             continue;
         }
@@ -686,7 +686,7 @@ fn color_pipeline_matches_decoder_working_space() {
             c[1] as f32 * plan.scale(),
             c[2] as f32 * plan.scale(),
         ];
-        if ours_no_matrix.iter().any(|v| !(0.0f32..=1.0).contains(v)) || w.iter().any(|v| *v == u16::MAX) {
+        if ours_no_matrix.iter().any(|v| !(0.0f32..=1.0).contains(v)) || w.contains(&u16::MAX) {
             continue;
         }
         for k in 0..3 {

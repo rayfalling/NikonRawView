@@ -12,6 +12,7 @@
 //! 实测确认 **NEF 装不下完整配方**：相机写入的载荷恒为 108 字节，而一条
 //! 257 级的色调曲线就需要 514 字节。因此身份在照片里，本体在配方文件里。
 
+pub mod calibrate;
 pub mod camera;
 pub mod color;
 pub mod error;
@@ -23,6 +24,7 @@ pub mod np3;
 pub mod picture_control;
 pub mod render;
 pub mod tiff;
+pub mod transform;
 
 pub use error::{Error, Result};
 pub use picture_control::{Identity, Adjust};

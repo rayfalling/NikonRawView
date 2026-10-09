@@ -251,12 +251,11 @@ mod tests {
         let d = derive_matrix(&pairs).expect("应能求解");
         assert_eq!(d.samples, 1600);
         assert!(d.rms < 1e-6, "rms={}", d.rms);
-        for i in 0..3 {
-            for j in 0..3 {
+        for (i, row) in d.matrix.iter().enumerate() {
+            for (j, v) in row.iter().enumerate() {
                 assert!(
-                    (d.matrix[i][j] - truth[i][j]).abs() < 1e-4,
-                    "[{i}][{j}] {} vs {}",
-                    d.matrix[i][j],
+                    (v - truth[i][j]).abs() < 1e-4,
+                    "[{i}][{j}] {v} vs {}",
                     truth[i][j]
                 );
             }

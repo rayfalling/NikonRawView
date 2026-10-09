@@ -4,8 +4,8 @@
 - [x] 1.2 实现 `build.rs`：调用 `vcvars64.bat` + `nmake /f Makefile.msvc` 构建 vendored LibRaw，输出 `cargo:rustc-link-search` 与 `cargo:rustc-link-lib=static=libraw_static`；已验证从干净状态（删除 `object/`、`bin/`、`libraw_static.lib`）`cargo build --offline` 能构建出静态库（80 个 .obj，112 秒）并链接成功
 - [x] 1.3 在 README 记录构建方式与 `nmake` 的理由：新增「构建」章节，写明前置条件（VS 的 C++ 工作负载）、首次构建耗时，以及**不得改用 MSBuild 的两条具体原因**（vcxproj 钉死 Windows SDK `10.0.18362.0` 与工具集 `v142`；`MSB6001` —— 进程环境块里大小写两份代理变量使 MSBuild 的 .NET 不区分大小写字典在构造子进程环境时抛异常，而从 PowerShell 删不掉）
 - [x] 1.4 CDDL 合规落地：补齐 `LICENSE-MIT`、`LICENSE-APACHE`（此前仓库**一个 LICENSE 文件都没有**；文本取自本地 cargo 缓存的权威副本而非手抄，Apache 全文 201 行含 `END OF TERMS`）、`THIRD_PARTY_LICENSES.md`（列 LibRaw 及其 CDDL 版本、源码位置、链接方式，并留档选型时评估过的替代方案与各自未采用的原因）；README 的「License」章节由"待定"补实，说明二进制含 CDDL 组件及其义务。已验证 README 引用的全部路径存在
-- [ ] 1.5 定义基准变换数据的文件格式（含版本字段、基准名、配方编码、来源清单），实现读写；验证写入后读回逐字段一致，且版本不匹配时给出明确错误
-- [ ] 1.6 建立渲染管线的模块骨架（解码 / 色彩 / 渲染 / 标定四个模块），验证 `cargo test` 通过且各模块可单独引用
+- [x] 1.5 定义基准变换数据的文件格式并实现读写（`src/transform.rs`）：小端二进制，`NBT\0` magic + 版本 + 基准编码 + 保留位 + 基准名 + 来源清单 + 一维色调曲线 + 3D LUT（含边长与项数）。已验证逐字段往返一致（含空载荷）、**中文路径的来源清单原样往返**（本项目照片库路径普遍含中文）、文件读写往返；并验证五类错误都被明确拒绝：版本不符（`UnsupportedVersion`，报出实际与期望值）、magic 不符、截断（6 个截断点）、末尾多余数据、保留位非零、LUT 项数与边长不符
+- [x] 1.6 建立渲染管线的模块骨架并验证各模块可独立引用：**解码** `libraw`、**色彩** `color` + `camera` + `mat3`、**渲染** `render`、**标定** `calibrate`（新建）。`calibrate` 定义了 `ReferencePair`/`Premises`/`Issue`/`ReferenceSet` 与文件存在性检查，并用常量 `CONTENT_VALIDATION_IMPLEMENTED = false` **显式声明内容校验尚未实现**——该常量带一条断言，实现后必须同步更新文档与任务 5.1，避免"校验已实现"被默默假设。`cargo test` 通过（93 项）
 
 ## 2. RAW 解码（capability `render/raw-decode`）
 

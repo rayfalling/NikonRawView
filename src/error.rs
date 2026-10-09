@@ -25,6 +25,10 @@ pub enum Error {
     RecipeNotFound(String),
     /// 渲染管线的前置条件不满足（输入不自洽，或缺少必需的数据）。
     InvalidInput(String),
+    /// 数据文件的版本不受支持。
+    UnsupportedVersion { what: &'static str, found: u32, expected: u32 },
+    /// 数据文件的标识不符（magic 不对，或内容截断）。
+    BadPayload { what: &'static str, detail: String },
 }
 
 impl fmt::Display for Error {
@@ -41,6 +45,11 @@ impl fmt::Display for Error {
             Error::NotRecipeContainer(m) => write!(f, "非配方容器，magic = {m:02X?}"),
             Error::RecipeNotFound(n) => write!(f, "配方库中未找到配方：{n}"),
             Error::InvalidInput(s) => write!(f, "输入不满足渲染前置条件：{s}"),
+            Error::UnsupportedVersion { what, found, expected } => write!(
+                f,
+                "{what} 的版本不受支持：文件为 {found}，本程序支持 {expected}"
+            ),
+            Error::BadPayload { what, detail } => write!(f, "{what} 内容有误：{detail}"),
         }
     }
 }
