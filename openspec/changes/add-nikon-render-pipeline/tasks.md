@@ -2,8 +2,8 @@
 
 - [x] 1.1 确定 RAW 解码方案并 vendor 源码：LibRaw 0.22 源码入 `third_party/libraw/`（CDDL-1.0），`Cargo.toml` 保持零 crate 依赖。已实测 `nmake /f Makefile.msvc` + `vcvars64` 可构建成功
 - [x] 1.2 实现 `build.rs`：调用 `vcvars64.bat` + `nmake /f Makefile.msvc` 构建 vendored LibRaw，输出 `cargo:rustc-link-search` 与 `cargo:rustc-link-lib=static=libraw_static`；已验证从干净状态（删除 `object/`、`bin/`、`libraw_static.lib`）`cargo build --offline` 能构建出静态库（80 个 .obj，112 秒）并链接成功
-- [ ] 1.3 在 README 记录构建方式与 `nmake` 的理由：**不得改用 MSBuild** —— 其 vcxproj 钉死 Windows SDK `10.0.18362.0` 与工具集 `v142`，且在沙箱内会被「同名不同大小写的代理环境变量」触发的 .NET 字典异常打断（`MSB6001`）
-- [ ] 1.4 CDDL 合规落地：补 `LICENSE-MIT`、`LICENSE-APACHE`（仓库自身目前**一个 LICENSE 文件都没有**）、`THIRD_PARTY_LICENSES.md`（列 LibRaw 及其 CDDL 版本与源码位置），README 增加「许可」章节说明二进制的第三方组件；验证 `third_party/libraw/LICENSE.CDDL` 随源码入库
+- [x] 1.3 在 README 记录构建方式与 `nmake` 的理由：新增「构建」章节，写明前置条件（VS 的 C++ 工作负载）、首次构建耗时，以及**不得改用 MSBuild 的两条具体原因**（vcxproj 钉死 Windows SDK `10.0.18362.0` 与工具集 `v142`；`MSB6001` —— 进程环境块里大小写两份代理变量使 MSBuild 的 .NET 不区分大小写字典在构造子进程环境时抛异常，而从 PowerShell 删不掉）
+- [x] 1.4 CDDL 合规落地：补齐 `LICENSE-MIT`、`LICENSE-APACHE`（此前仓库**一个 LICENSE 文件都没有**；文本取自本地 cargo 缓存的权威副本而非手抄，Apache 全文 201 行含 `END OF TERMS`）、`THIRD_PARTY_LICENSES.md`（列 LibRaw 及其 CDDL 版本、源码位置、链接方式，并留档选型时评估过的替代方案与各自未采用的原因）；README 的「License」章节由"待定"补实，说明二进制含 CDDL 组件及其义务。已验证 README 引用的全部路径存在
 - [ ] 1.5 定义基准变换数据的文件格式（含版本字段、基准名、配方编码、来源清单），实现读写；验证写入后读回逐字段一致，且版本不匹配时给出明确错误
 - [ ] 1.6 建立渲染管线的模块骨架（解码 / 色彩 / 渲染 / 标定四个模块），验证 `cargo test` 通过且各模块可单独引用
 

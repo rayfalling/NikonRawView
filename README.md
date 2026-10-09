@@ -95,6 +95,32 @@ out/       生成的 DCP / 预设
 - [ ] 快速看图器
 - [ ] 标定与 DCP 导出
 
+## 构建
+
+```bash
+cargo build --release
+```
+
+### 前置条件
+
+RAW 解码使用 [LibRaw](https://www.libraw.org/)，其源码随仓库分发在 `third_party/libraw/`，由 `build.rs` 自动构建。因此构建机需要：
+
+- **Visual Studio 的「使用 C++ 的桌面开发」工作负载**（提供 `cl.exe`、`nmake` 与 `vcvars64.bat`）
+- Rust 工具链
+
+`build.rs` 通过 `vswhere` 定位 `vcvars64.bat`；若定位失败，可设环境变量 `VCVARS64` 指向它的完整路径。
+
+首次构建会花约 2 分钟编译 LibRaw（80 个源文件）；静态库已存在时跳过。
+
+### 为什么用 nmake 而不是 MSBuild
+
+LibRaw 0.22 **没有 CMakeLists.txt**，官方构建路径之一是 `Makefile.msvc`。选它而非 `LibRaw.sln`／MSBuild 有两个具体原因：
+
+1. `buildfiles/libraw.vcxproj` 钉死 **Windows SDK `10.0.18362.0`** 与平台工具集 **`v142`**（VS 2019）。用较新的 Visual Studio 构建会直接报 `MSB8036`／`MSB8020`。
+2. 即使覆盖了上述两项，仍会失败于 `MSB6001`：当进程环境块里**同时存在大小写两份代理变量**（如 `HTTP_PROXY` 与 `http_proxy`）时，MSBuild 用于构造子进程环境的 .NET 字典不区分大小写，遇到重复键直接抛异常。PowerShell 的 `Env:` 提供程序会把两者规范成一条，因此**从 PowerShell 里删不掉**。
+
+`nmake` 是纯 Win32 工具，不走 .NET，不受第 2 条影响；改用 `Makefile.msvc` 也完全绕开了第 1 条。
+
 ## 开发流程
 
 本项目使用 [OpenSpec](https://github.com/Fission-AI/OpenSpec) 做规范驱动开发（`schema: spec-driven`）：
@@ -124,4 +150,19 @@ openspec status --change <change-name> # 查看产物完成度
 
 ## License
 
-待定。
+本仓库自身为 **MIT OR Apache-2.0** 双许可，可任选其一：
+
+- [LICENSE-MIT](LICENSE-MIT)
+- [LICENSE-APACHE](LICENSE-APACHE)
+
+### 第三方组件
+
+**构建出的二进制包含第三方代码，其许可与本仓库自身不同。**
+
+| 组件 | 许可 | 源码位置 |
+|---|---|---|
+| LibRaw 0.22 | **CDDL-1.0** | [`third_party/libraw/`](third_party/libraw/)（随仓库分发） |
+
+CDDL-1.0 是**文件级** copyleft：把它链接进本仓库不改变本仓库自身代码的许可，也不要求"可重新链接"；但**分发二进制时须随附 LibRaw 的源码**。本仓库已将其源码入库（含 `LICENSE.CDDL` 与 `COPYRIGHT`），因此由本仓库构建并分发的二进制满足该要求。
+
+完整的组件清单、许可全文位置与合规说明见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
