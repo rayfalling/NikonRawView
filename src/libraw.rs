@@ -203,7 +203,7 @@ impl Default for Options {
 }
 
 /// 一次解码的结果。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Decoded {
     /// 输出像素的尺寸（等于 LibRaw 的 `iwidth` × `iheight`）。
     pub width: usize,
@@ -216,6 +216,8 @@ pub struct Decoded {
     pub rgb_cam: [[f32; 3]; 3],
     pub color_maximum: i32,
     pub demosaic: Demosaic,
+    /// 本次解码实际使用的输出色彩空间。
+    pub output: OutputColor,
     /// 传感器原始尺寸，含光学黑/掩蔽边框。
     pub raw_width: usize,
     pub raw_height: usize,
@@ -278,12 +280,11 @@ unsafe fn take_image(img: *mut ProcessedImage) -> Result<(usize, usize, Vec<u16>
     Ok((w, ht, out))
 }
 
-/// 解码一张 RAW，输出**线性相机空间**的 16 位 RGB，并取出标定元数据。
+/// 解码一张 RAW，以指定输出色彩空间产出 16 位像素，并取出标定元数据。
 ///
-/// 关键点：输出色彩空间设为 [`OutputColor::Camera`]（不做转换）、gamma 设为线性、
-/// 关闭自动亮度——因此结果不含任何相机内观感，也仍在相机空间。转入工作空间是
-/// [`crate::color`] 的职责。
-pub fn decode_camera_linear(path: &Path, opts: &Options) -> Result<Decoded> {
+/// 输出恒为线性（gamma 索引 0 与 1 都设为 1.0）且关闭自动亮度，因此结果不含
+/// 任何相机内观感或自动增益。
+fn decode_with_output(path: &Path, opts: &Options, output: OutputColor) -> Result<Decoded> {
     if !path.is_file() {
         return Err(Error::Io(format!("文件不存在：{}", path.display())));
     }
@@ -307,24 +308,20 @@ pub fn decode_camera_linear(path: &Path, opts: &Options) -> Result<Decoded> {
         }
         libraw_set_demosaic(lr, opts.demosaic as c_int);
 
-        // 先以 ProPhoto 输出跑一遍，只为让 LibRaw 计算 rgb_cam 并把它取出来。
-        // rgb_cam 在 dcraw_process 内部计算，没有更廉价的取得方式。
-        libraw_set_output_color(lr, OutputColor::ProPhoto as c_int);
+        libraw_set_output_color(lr, output as c_int);
+        libraw_set_output_bps(lr, 16);
+        libraw_set_gamma(lr, 0, 1.0);
+        libraw_set_gamma(lr, 1, 1.0);
+        libraw_set_no_auto_bright(lr, 1);
         check(libraw_dcraw_process(lr))?;
+
+        // rgb_cam 在 dcraw_process 内部计算，因此必须在处理后取
         let mut rgb_cam = [[0.0f32; 3]; 3];
         for (i, row) in rgb_cam.iter_mut().enumerate() {
             for (j, v) in row.iter_mut().enumerate() {
                 *v = libraw_get_rgb_cam(lr, i as c_int, j as c_int);
             }
         }
-
-        // 再以相机空间输出跑第二遍，取未做色彩转换的线性像素
-        libraw_set_output_color(lr, OutputColor::Camera as c_int);
-        libraw_set_output_bps(lr, 16);
-        libraw_set_gamma(lr, 0, 1.0);
-        libraw_set_gamma(lr, 1, 1.0);
-        libraw_set_no_auto_bright(lr, 1);
-        check(libraw_dcraw_process(lr))?;
 
         let mut errc: c_int = 0;
         let img = libraw_dcraw_make_mem_image(lr, &mut errc);
@@ -353,6 +350,7 @@ pub fn decode_camera_linear(path: &Path, opts: &Options) -> Result<Decoded> {
             rgb_cam,
             color_maximum,
             demosaic: opts.demosaic,
+            output,
             raw_width,
             raw_height,
         };
@@ -365,6 +363,56 @@ pub fn decode_camera_linear(path: &Path, opts: &Options) -> Result<Decoded> {
         );
         Ok(d)
     }
+}
+
+/// 只读出白平衡系数，不做去马赛克与色彩转换。
+///
+/// 用于快速扫描一批文件找出白平衡不同的样本——完整解码一张 45 MP 的 NEF 要十几秒，
+/// 而这一步只到 `unpack` 为止。
+pub fn read_wb(path: &Path) -> Result<[f32; 3]> {
+    if !path.is_file() {
+        return Err(Error::Io(format!("文件不存在：{}", path.display())));
+    }
+    let cpath = CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|_| Error::BadPath(path.display().to_string()))?;
+    let session = Session(unsafe { libraw_init(0) });
+    if session.0.is_null() {
+        return Err(Error::NoHandle);
+    }
+    let lr = session.0;
+    unsafe {
+        check(libraw_open_file(lr, cpath.as_ptr()))?;
+        check(libraw_unpack(lr))?;
+        Ok([
+            libraw_get_cam_mul(lr, 0),
+            libraw_get_cam_mul(lr, 1),
+            libraw_get_cam_mul(lr, 2),
+        ])
+    }
+}
+
+/// 解码一张 RAW，输出**线性相机空间**的 16 位 RGB。
+///
+/// 结果仍在相机空间、且不含相机内观感——转入工作空间是 [`crate::color`] 的职责。
+///
+/// # 为什么解码两遍
+///
+/// `rgb_cam` 只有在输出色彩空间**不是**相机空间时才是有效变换（相机空间下它是
+/// 恒等）。而 `rgb_cam` 又在 `dcraw_process` 内部才计算。因此先跑一遍 ProPhoto
+/// 取矩阵，再跑一遍取相机空间像素。这是 LibRaw 的 C API 所决定的代价。
+pub fn decode_camera_linear(path: &Path, opts: &Options) -> Result<Decoded> {
+    let pro = decode_with_output(path, opts, OutputColor::ProPhoto)?;
+    let mut cam = decode_with_output(path, opts, OutputColor::Camera)?;
+    cam.rgb_cam = pro.rgb_cam;
+    Ok(cam)
+}
+
+/// 解码一张 RAW，**直接**输出工作空间（ProPhoto）线性像素。
+///
+/// 与「取相机空间像素 + 本管线自行施加矩阵」互为对照，用于交叉验证矩阵施加
+/// 是否与解码层内部一致。日常渲染不应走这条——它会就地裁到 0..65535。
+pub fn decode_working_space(path: &Path, opts: &Options) -> Result<Decoded> {
+    decode_with_output(path, opts, OutputColor::ProPhoto)
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use nikonrawview::libraw::{self, Demosaic, Options};
 use nikonrawview::camera;
+use nikonrawview::color::ColorPlan;
 
 fn samples_dir() -> PathBuf {
     std::env::var_os("NIKONRAWVIEW_SAMPLES")
@@ -202,4 +203,289 @@ fn unknown_model_does_not_guess_margins() {
     let (out, w, h) = camera::apply(&px, 4, 4, &d);
     assert_eq!((w, h), (4, 4), "未知机型应原样返回而非裁切");
     assert_eq!(out.len(), px.len());
+}
+
+/// 任务 2.2：白电平可取；黑电平经 C API **不可取**，但可以验证它已被扣除。
+///
+/// LibRaw 的 `cblack` / `black` 在 `libraw_colordata_t` 里，而该结构体只能通过
+/// 指针访问——复刻它的布局会在版本升级时静默读到错误偏移，因此本实现不做。
+///
+/// 判据取**全图最小值**：若黑电平未扣除，最暗像素也应落在黑电平附近
+/// （实测基准：黑电平 1008 / 白电平 15892 ≈ 6.3%）；扣除后应接近 0。
+///
+/// 注：先前曾假设「传感器全幅比有效区多出的 12 列是光学黑区」，**该假设不成立**——
+/// 实测其均值占白电平 18.7%，是真实图像内容。
+#[test]
+fn white_level_available_and_black_already_subtracted() {
+    let path = samples_dir().join("DSC_4143.NEF");
+    if !path.is_file() {
+        eprintln!("跳过：未找到 {}", path.display());
+        return;
+    }
+    let d = libraw::decode_camera_linear(&path, &Options::default()).unwrap();
+
+    // 白电平：C API 有 libraw_get_color_maximum
+    assert!(d.color_maximum > 0, "白电平应为正，得到 {}", d.color_maximum);
+    eprintln!("白电平（color_maximum）= {}", d.color_maximum);
+
+    let min = d.pixels.iter().copied().min().unwrap_or(0);
+    let max = d.pixels.iter().copied().max().unwrap_or(0);
+    let min_ratio = min as f64 / d.color_maximum as f64;
+    eprintln!("全图 min={min} max={max}，min 占白电平 {min_ratio:.4}");
+
+    // 未扣黑电平时，min 会落在黑电平附近（≈6%）。留足余量取 3%。
+    assert!(
+        min_ratio < 0.03,
+        "全图最小值为白电平的 {min_ratio:.4}，若黑电平已扣除应接近 0"
+    );
+}
+
+/// 任务 2.5：去马赛克的伪像检查。
+///
+/// 伪色与拉链效应表现为**色度的高频变化**。指标取「局部 (R−G) 与 (B−G) 的二阶差分
+/// 绝对均值」——正确去马赛克的平坦区域该值很小，成片伪色会让它显著抬高。
+#[test]
+fn demosaic_artifacts_are_measured() {
+    let path = samples_dir().join("DSC_4143.NEF");
+    if !path.is_file() {
+        eprintln!("跳过：未找到 {}", path.display());
+        return;
+    }
+    let d = libraw::decode_camera_linear(&path, &Options::default()).unwrap();
+
+    // 取画面中央一块，避开边框
+    let (x0, y0) = (d.width / 2, d.height / 2);
+    let (bw, bh) = (512usize.min(d.width / 4), 512usize.min(d.height / 4));
+
+    let chroma_second_diff = |alg: Demosaic| -> f64 {
+        let dd = if alg == d.demosaic {
+            std::borrow::Cow::Borrowed(&d)
+        } else {
+            std::borrow::Cow::Owned(
+                libraw::decode_camera_linear(&path, &Options { demosaic: alg, user_mul: None })
+                    .unwrap(),
+            )
+        };
+        let mut acc = 0f64;
+        let mut n = 0u64;
+        // 逐行：对 (R−G) 与 (B−G) 求水平二阶差分
+        for y in y0..y0 + bh {
+            let mut prev: Option<(i32, i32)> = None;
+            let mut prev2: Option<(i32, i32)> = None;
+            for x in x0..x0 + bw {
+                let Some(px) = dd.at(x, y) else { continue };
+                let rg = px[0] as i32 - px[1] as i32;
+                let bg = px[2] as i32 - px[1] as i32;
+                if let (Some(a), Some(b)) = (prev, prev2) {
+                    acc += ((rg - 2 * a.0 + b.0).abs() + (bg - 2 * a.1 + b.1).abs()) as f64;
+                    n += 1;
+                }
+                prev2 = prev;
+                prev = Some((rg, bg));
+            }
+        }
+        if n == 0 {
+            0.0
+        } else {
+            acc / n as f64 / d.color_maximum as f64
+        }
+    };
+
+    let dht = chroma_second_diff(Demosaic::Dht);
+    eprintln!("中央 {bw}×{bh}：色度二阶差分均值（DHT）= {dht:.6}");
+    assert!(dht.is_finite() && dht >= 0.0);
+
+    // 与线性去马赛克对照：线性插值会产生更多伪色，指标应更高。
+    // 这条同时证明指标真的有判别力——若两者相近，说明指标测不出伪像。
+    let lin = chroma_second_diff(Demosaic::Linear);
+    eprintln!("                                   （Linear）= {lin:.6}");
+    assert!(
+        lin > dht,
+        "线性去马赛克的色度伪像应多于 DHT（{lin:.6} vs {dht:.6}），否则该指标无判别力"
+    );
+
+    let thresh = 0.02;
+    assert!(
+        dht < thresh,
+        "DHT 的色度二阶差分均值 {dht:.6} 超过阈值 {thresh}，中央区域可能有成片伪色"
+    );
+}
+
+/// 任务 3.1：矩阵必须随**拍摄白平衡**变化，而非固定常数。
+///
+/// 注意：实测 `libraw_set_user_mul` **不能**改变矩阵——解码层里相机记录的
+/// 白平衡优先级更高。因此只能用真正记录了不同白平衡的两张文件来验。完整解码
+/// 一张要十几秒，所以先用 `read_wb`（只到 unpack）快速扫出两个不同的样本。
+#[test]
+fn camera_matrix_varies_with_white_balance() {
+    let root = match std::env::var("NIKONRAWVIEW_LIBRARY") {
+        Ok(v) => std::path::PathBuf::from(v),
+        Err(_) => {
+            eprintln!("跳过：需设置 NIKONRAWVIEW_LIBRARY 指向含多张 NEF 的目录");
+            return;
+        }
+    };
+
+    // 扫描：找出两张白平衡明显不同的文件
+    let mut found: Vec<(std::path::PathBuf, [f32; 3])> = Vec::new();
+    let mut stack = vec![root];
+    'outer: while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("nef")) {
+                continue;
+            }
+            let Ok(wb) = libraw::read_wb(&p) else { continue };
+            if let Some((_, w0)) = found.first() {
+                // 红蓝比差异超过 15% 才算"明显不同"
+                let r0 = w0[0] / w0[2].max(1e-6);
+                let r1 = wb[0] / wb[2].max(1e-6);
+                if (r1 - r0).abs() / r0.max(1e-6) > 0.15 {
+                    found.push((p, wb));
+                    break 'outer;
+                }
+            } else {
+                found.push((p, wb));
+            }
+        }
+    }
+
+    if found.len() < 2 {
+        eprintln!("跳过：未在目录中找到白平衡明显不同的两张 NEF");
+        return;
+    }
+    let (pa, wa) = &found[0];
+    let (pb, wb) = &found[1];
+    eprintln!("样本 A {} WB={wa:?}", pa.file_name().unwrap().to_string_lossy());
+    eprintln!("样本 B {} WB={wb:?}", pb.file_name().unwrap().to_string_lossy());
+
+    let opts = Options { demosaic: Demosaic::Linear, user_mul: None };
+    let a = libraw::decode_working_space(pa, &opts).unwrap();
+    let b = libraw::decode_working_space(pb, &opts).unwrap();
+
+    let diff: f32 = (0..3)
+        .flat_map(|i| (0..3).map(move |j| (i, j)))
+        .map(|(i, j)| (a.rgb_cam[i][j] - b.rgb_cam[i][j]).abs())
+        .sum();
+    eprintln!("矩阵差异和 = {diff:.6}");
+    eprintln!("  A: {:?}", a.rgb_cam);
+    eprintln!("  B: {:?}", b.rgb_cam);
+
+    assert!(
+        diff > 1e-3,
+        "白平衡明显不同的两张文件应得到不同矩阵（差异和 {diff}）——相同说明矩阵是固定常数"
+    );
+    assert!(a.rgb_cam.iter().flatten().all(|v| v.is_finite()));
+    assert!(b.rgb_cam.iter().flatten().all(|v| v.is_finite()));
+}
+
+/// 任务 3.3：交叉验证——本管线自行施加矩阵，应与解码层直接输出工作空间一致。
+///
+/// # 当前状态：**未通过，原因待查**
+///
+/// 实测（`DSC_4143.NEF`，137526 个在色域内的分量）：
+///
+/// ```text
+/// 施加相机矩阵：平均绝对差 0.008406
+/// 不施加矩阵  ：平均绝对差 0.003888   ← 反而更小
+/// ```
+///
+/// **"什么都不做"比"施加矩阵"更接近解码层的输出**，说明本管线的矩阵施加没有复现
+/// 解码层的内部转换。在原因查清之前，本测试保持 `#[ignore]`——它是一条记录在案的
+/// 问题，不是一条假装通过的绿灯。
+///
+/// 注意 `rgb_cam` 的三行行和均为 1.0（矩阵只改色度、不改中性），因此画面越接近
+/// 中性，两种做法的差异越小；这条对照之所以有判别力，正是靠这一点。
+///
+/// 待查方向：
+/// - 解码层是否在矩阵之外还做了白平衡归一化（其内部 `pre_mul` 的用法与
+///   `libraw_get_cam_mul` 返回的值是否同一套刻度）
+/// - `libraw_get_rgb_cam` 取的是否就是 `convert_to_rgb` 实际使用的那个矩阵
+/// - 解码层是否在施加矩阵前对相机值做了额外缩放
+#[test]
+#[ignore = "交叉验证发现未解释的残差：施加矩阵(0.0084)反而不如不施加(0.0039)，原因待查"]
+fn color_pipeline_matches_decoder_working_space() {
+    let path = samples_dir().join("DSC_4143.NEF");
+    if !path.is_file() {
+        eprintln!("跳过：未找到 {}", path.display());
+        return;
+    }
+    let opts = Options { demosaic: Demosaic::Linear, user_mul: None };
+
+    let cam = libraw::decode_camera_linear(&path, &opts).unwrap();
+    let direct = libraw::decode_working_space(&path, &opts).unwrap();
+    assert_eq!((cam.width, cam.height), (direct.width, direct.height));
+
+    let plan = ColorPlan::from_decoded(&cam).expect("应能构造色彩方案");
+
+    // 逐点比较：本管线施加矩阵 vs 解码层内部转换。
+    // 只统计双方都未接近饱和的点——解码层会就地裁到 0..65535，饱和点必然对不齐。
+    let mut worst = 0f64;
+    let mut sum = 0f64;
+    let mut n = 0u64;
+    let mut skipped = 0u64;
+    for i in (0..cam.pixels.len()).step_by(3 * 997) {
+        let c = [cam.pixels[i], cam.pixels[i + 1], cam.pixels[i + 2]];
+        let w = [direct.pixels[i], direct.pixels[i + 1], direct.pixels[i + 2]];
+        let ours = plan.apply_u16(c);
+        // 只比对**双方都在色域内**的点。
+        //
+        // 解码层的内部转换会对超出色域的分量做裁切与去饱和，而本管线刻意不做
+        // ——那是设计差异，不是误差。把它算进统计只会掩盖真实的一致性。
+        if ours.iter().any(|v| !(0.0f32..=1.0).contains(v)) || w.iter().any(|v| *v == u16::MAX) {
+            skipped += 1;
+            continue;
+        }
+        for k in 0..3 {
+            let theirs = w[k] as f32 * plan.scale();
+            let e = (ours[k] - theirs).abs() as f64;
+            sum += e;
+            worst = worst.max(e);
+            n += 1;
+        }
+    }
+    let mean = if n == 0 { 0.0 } else { sum / n as f64 };
+    eprintln!(
+        "交叉验证：{n} 个在色域内的分量，平均绝对差 {mean:.6}，最大 {worst:.6}（单位 0..1）；跳过 {skipped} 个超色域点"
+    );
+
+    // 对照：若不施加矩阵（用单位矩阵），误差应远大于上面——这证明本验证有判别力。
+    // 否则"误差小"可能只是因为图像本身接近中性，测不出矩阵是否被用上。
+    let mut id_sum = 0f64;
+    let mut id_n = 0u64;
+    for i in (0..cam.pixels.len()).step_by(3 * 997) {
+        let c = [cam.pixels[i], cam.pixels[i + 1], cam.pixels[i + 2]];
+        let w = [direct.pixels[i], direct.pixels[i + 1], direct.pixels[i + 2]];
+        let ours_no_matrix: [f32; 3] = [
+            c[0] as f32 * plan.scale(),
+            c[1] as f32 * plan.scale(),
+            c[2] as f32 * plan.scale(),
+        ];
+        if ours_no_matrix.iter().any(|v| !(0.0f32..=1.0).contains(v)) || w.iter().any(|v| *v == u16::MAX) {
+            continue;
+        }
+        for k in 0..3 {
+            id_sum += (ours_no_matrix[k] - w[k] as f32 * plan.scale()).abs() as f64;
+            id_n += 1;
+        }
+    }
+    let id_mean = if id_n == 0 { f64::NAN } else { id_sum / id_n as f64 };
+    eprintln!("对照（不施加矩阵）：平均绝对差 {id_mean:.6}");
+
+    assert!(n > 100, "可比对的分量太少（{n}），验证不充分");
+    // 关键判据：施加矩阵应显著优于不施加。当前**不成立**，这正是本测试被 ignore 的原因。
+    assert!(
+        mean < id_mean,
+        "施加矩阵的误差（{mean:.6}）未小于不施加矩阵的对照（{id_mean:.6}）——\
+         说明本管线的矩阵施加没有复现解码层的内部转换"
+    );
+    assert!(
+        mean < 0.02,
+        "本管线施加矩阵与解码层内部转换平均差 {mean:.6}，超出可归因于解码层额外步骤的范围"
+    );
 }

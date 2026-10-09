@@ -374,6 +374,113 @@ impl Transform {
 }
 
 // ---------------------------------------------------------------------------
+// 基准与配方的组合
+// ---------------------------------------------------------------------------
+
+/// 一份基准变换——由标定环节从参考导出拟合而来（见 `picture-control/calibration`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Baseline {
+    /// 基准**编码**，来自配方身份的 base code。
+    pub code: u16,
+    /// 基准名，仅用于展示与诊断——**不是标识**。
+    pub name: String,
+    pub transform: Transform,
+}
+
+/// 基准选择的结果。
+///
+/// 把"选不到"的几种原因分开，是为了让上游能区分「本机没有这份基准」与
+/// 「这个配方根本没带编码」，而不是笼统地报一个"未找到"。
+#[derive(Debug)]
+pub enum BaselineChoice<'a> {
+    /// 按编码命中。
+    ByCode(&'a Baseline),
+    /// 配方身份里没有基准编码——名称不是标识，不能用来选。
+    NoCode { base_name: String },
+    /// 有编码但本机没有对应的基准变换。
+    Missing { code: u16, base_name: String },
+}
+
+impl BaselineChoice<'_> {
+    pub fn selected(&self) -> Option<&Baseline> {
+        match self {
+            BaselineChoice::ByCode(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            BaselineChoice::ByCode(b) => {
+                format!("按编码 0x{:04X} 命中基准「{}」", b.code, b.name)
+            }
+            BaselineChoice::NoCode { base_name } => format!(
+                "配方身份缺少基准编码（名称「{base_name}」不是标识，不能据此选择）"
+            ),
+            BaselineChoice::Missing { code, base_name } => format!(
+                "本机没有编码 0x{code:04X} 对应的基准变换（配方标称基准名「{base_name}」）"
+            ),
+        }
+    }
+}
+
+/// 按**编码**选择基准。
+///
+/// 明确拒绝按名称选择：实测同一编码可以有不同名称的标称（`0x03C2` 既被写作
+/// `NEUTRAL` 也被写作 `Kodak-Sun-Nature` 的基准），名称不是标识。
+pub fn select_baseline<'a>(
+    baselines: &'a [Baseline],
+    base_code: Option<u16>,
+    base_name: &str,
+) -> BaselineChoice<'a> {
+    match base_code {
+        None => BaselineChoice::NoCode { base_name: base_name.to_string() },
+        Some(code) => match baselines.iter().find(|b| b.code == code) {
+            Some(b) => BaselineChoice::ByCode(b),
+            None => BaselineChoice::Missing { code, base_name: base_name.to_string() },
+        },
+    }
+}
+
+/// 渲染管线：**先基准、后配方**。
+///
+/// 顺序是硬性的——基准把线性光带到显示参考域，配方再在这个域上做调整。反过来
+/// 施加会让配方的曲线作用在错误的定义域上。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pipeline {
+    pub baseline: Option<Baseline>,
+    pub recipe: Transform,
+}
+
+impl Pipeline {
+    pub fn new(baseline: Option<Baseline>, recipe: Transform) -> Self {
+        Self { baseline, recipe }
+    }
+
+    /// 处理步骤，含基准那一环。
+    pub fn steps(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.baseline.is_some() {
+            v.push("baseline");
+        }
+        v.extend_from_slice(Transform::step_order());
+        v
+    }
+
+    pub fn apply_pixel(&self, v: [f32; 3]) -> [f32; 3] {
+        let v = match &self.baseline {
+            Some(b) => b.transform.apply_pixel(v),
+            None => v,
+        };
+        self.recipe.apply_pixel(v)
+    }
+
+    pub fn apply_image(&self, src: &[[f32; 3]]) -> Vec<[f32; 3]> {
+        src.iter().map(|p| self.apply_pixel(*p)).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 色彩空间辅助
 // ---------------------------------------------------------------------------
 
@@ -733,5 +840,95 @@ mod tests {
                 assert!(approx(back[i], v[i], 1e-4), "{v:?} → {back:?}");
             }
         }
+    }
+
+    // --- 基准选择与组合 ---
+
+    fn baseline(code: u16, name: &str, strength: f32) -> Baseline {
+        let mut t = default_t();
+        // 用一条简单的曲线把基准做得可辨识
+        t.curve = Some((0..257).map(|i| (i as f32 / 256.0) * strength).collect());
+        Baseline { code, name: name.to_string(), transform: t }
+    }
+
+    #[test]
+    fn baseline_is_selected_by_code_not_by_name() {
+        // 同一编码、两个不同名称——实测中 0x03C2 既被写作 NEUTRAL 也被写作别的名字
+        let set = vec![baseline(0x03C2, "NEUTRAL", 1.0), baseline(0x0020, "FLEXIBLE COLOR", 0.5)];
+
+        let a = select_baseline(&set, Some(0x03C2), "NEUTRAL");
+        let b = select_baseline(&set, Some(0x03C2), "换个名字但同一编码");
+        let ba = a.selected().expect("应命中");
+        let bb = b.selected().expect("应命中");
+        assert_eq!(ba.code, bb.code, "两个名称不同但编码相同的配方应选中同一份基准");
+        assert!(std::ptr::eq(ba, bb), "应指向同一份基准数据");
+
+        // 名称相同但编码不同 → 必须选到不同的一份（名称不是标识）
+        let c = select_baseline(&set, Some(0x0020), "NEUTRAL");
+        assert_eq!(c.selected().unwrap().code, 0x0020);
+        assert!(!std::ptr::eq(c.selected().unwrap(), ba));
+    }
+
+    #[test]
+    fn missing_code_is_reported_not_guessed() {
+        let set = vec![baseline(0x03C2, "NEUTRAL", 1.0)];
+        // 名称能对上，但没有编码 —— 不得据此选择
+        let c = select_baseline(&set, None, "NEUTRAL");
+        assert!(matches!(c, BaselineChoice::NoCode { .. }), "{c:?}");
+        assert!(c.selected().is_none(), "缺编码时不得凭名称选中");
+        assert!(c.describe().contains("不是标识"));
+    }
+
+    #[test]
+    fn unknown_code_is_reported_with_the_code() {
+        let set = vec![baseline(0x03C2, "NEUTRAL", 1.0)];
+        let c = select_baseline(&set, Some(0x00C3), "Kodak Ektar Green");
+        assert!(matches!(c, BaselineChoice::Missing { code: 0x00C3, .. }), "{c:?}");
+        assert!(c.describe().contains("0x00C3"));
+    }
+
+    #[test]
+    fn pipeline_applies_baseline_before_recipe() {
+        // 基准把 0.5 压到 0.25；配方再把整体抬 0.1。
+        // 若顺序反过来，结果会不同——这正是要固定的。
+        let mut bt = default_t();
+        bt.curve = Some((0..257).map(|i| (i as f32 / 256.0) * 0.5).collect());
+        let base = Baseline { code: 1, name: "B".into(), transform: bt };
+
+        let mut recipe = default_t();
+        recipe.scalars.brightness = 25.6; // /128*0.5 = +0.1
+
+        let p = Pipeline::new(Some(base), recipe);
+        let out = p.apply_pixel([0.5, 0.5, 0.5]);
+        // 先基准：0.5 → 0.25；再配方：0.25 + 0.1 = 0.35
+        assert!(approx(out[0], 0.35, 0.02), "应先基准后配方，得到 {out:?}");
+
+        // 反序会得到约 0.5*0.5+0.1 = 0.35 —— 数值巧合，改用非线性的曲线再验一次
+        let mut bt2 = default_t();
+        bt2.curve = Some((0..257).map(|i| (i as f32 / 256.0).powi(2)).collect());
+        let base2 = Baseline { code: 1, name: "B".into(), transform: bt2 };
+        let p2 = Pipeline::new(Some(base2), default_t());
+        let out2 = p2.apply_pixel([0.5, 0.5, 0.5]);
+        assert!(approx(out2[0], 0.25, 0.02), "先基准应得 0.25，得到 {out2:?}");
+    }
+
+    #[test]
+    fn pipeline_reports_baseline_in_step_order() {
+        let p = Pipeline::new(None, default_t());
+        assert_eq!(p.steps(), vec!["curve", "hue-blender", "color-grading", "scalars"]);
+        let p2 = Pipeline::new(Some(baseline(1, "B", 1.0)), default_t());
+        assert_eq!(p2.steps()[0], "baseline");
+        assert_eq!(p2.steps().len(), 5);
+    }
+
+    #[test]
+    fn pipeline_is_pure() {
+        let p = Pipeline::new(Some(baseline(1, "B", 0.7)), default_t());
+        let src = vec![[0.2f32, 0.4, 0.6], [0.9, 0.1, 0.5]];
+        let before = src.clone();
+        let a = p.apply_image(&src);
+        let b = p.apply_image(&src);
+        assert_eq!(src, before);
+        assert_eq!(a, b);
     }
 }

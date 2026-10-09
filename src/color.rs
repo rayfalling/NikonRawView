@@ -23,16 +23,28 @@ use crate::mat3::{self, Mat3};
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColorPlan {
     matrix: Mat3,
-    /// 把解码层的 16 位整数换算到 0..1 的比例（= 1 / 色彩上限）。
+    /// 把解码层的 16 位整数换算到 0..1 的比例。
     scale: f32,
+    /// 解码层报告的白电平（原始域），仅用于报告与自检。
+    color_maximum: i32,
 }
+
+/// 解码层输出的位深满量程。
+///
+/// 我们请求 `output_bps = 16`，解码层据此把**相机白电平映射到 65535**——
+/// 实测印证：输出最大值确实是 65535，而 `libraw_get_color_maximum` 返回的
+/// `15375` 是**原始域**的白电平，不是输出域的刻度。
+///
+/// 这一点曾经搞错过：原先按 `1 / color_maximum` 归一化，结果白电平被映射到
+/// 4.26 而不是 1.0。是任务 3.3 的交叉验证把它抓出来的。
+const OUTPUT_FULL_SCALE: f32 = 65535.0;
 
 impl ColorPlan {
     /// 由解码结果构造。
     pub fn from_decoded(d: &Decoded) -> Result<Self> {
         if d.color_maximum <= 0 {
             return Err(Error::InvalidInput(format!(
-                "色彩上限非正（{}），无法把像素值换算到 0..1",
+                "色彩上限非正（{}），无法确认解码层的电平刻度",
                 d.color_maximum
             )));
         }
@@ -42,7 +54,11 @@ impl ColorPlan {
         if mat3::inverse(d.rgb_cam).is_none() {
             return Err(Error::InvalidInput("相机矩阵不可逆，说明取到的不是有效标定".into()));
         }
-        Ok(Self { matrix: d.rgb_cam, scale: 1.0 / d.color_maximum as f32 })
+        Ok(Self {
+            matrix: d.rgb_cam,
+            scale: 1.0 / OUTPUT_FULL_SCALE,
+            color_maximum: d.color_maximum,
+        })
     }
 
     /// 矩阵本身，供结果记录与手工复核。
@@ -52,6 +68,16 @@ impl ColorPlan {
 
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// 解码层报告的原始域白电平。
+    pub fn color_maximum(&self) -> i32 {
+        self.color_maximum
+    }
+
+    /// 把 0..1 归一化值换算回 16 位输出刻度。
+    pub fn to_u16(&self, v: f32) -> u16 {
+        (v * OUTPUT_FULL_SCALE).clamp(0.0, OUTPUT_FULL_SCALE) as u16
     }
 
     /// 完整 9 分量的可读表示。
@@ -97,6 +123,7 @@ mod tests {
             rgb_cam: matrix,
             color_maximum,
             demosaic: Demosaic::Dht,
+            output: crate::libraw::OutputColor::Camera,
             raw_width: 1,
             raw_height: 1,
         }
@@ -104,12 +131,26 @@ mod tests {
 
     #[test]
     fn identity_matrix_preserves_values() {
-        let d = fake(mat3::IDENTITY, 1000);
+        let d = fake(mat3::IDENTITY, 15375);
         let p = ColorPlan::from_decoded(&d).unwrap();
-        let got = p.apply_u16([1000, 500, 250]);
-        assert!((got[0] - 1.0).abs() < 1e-6);
-        assert!((got[1] - 0.5).abs() < 1e-6);
-        assert!((got[2] - 0.25).abs() < 1e-6);
+        // 满量程 65535 应映射到 1.0——白电平在输出域就是满量程
+        let got = p.apply_u16([65535, 32768, 16384]);
+        assert!((got[0] - 1.0).abs() < 1e-6, "{got:?}");
+        assert!((got[1] - 0.5).abs() < 2e-4, "{got:?}");
+        assert!((got[2] - 0.25).abs() < 2e-4, "{got:?}");
+    }
+
+    #[test]
+    fn full_scale_is_output_range_not_color_maximum() {
+        // 回归：曾按 1/color_maximum 归一化，导致白电平被映射到 65535/15375 ≈ 4.26
+        let d = fake(mat3::IDENTITY, 15375);
+        let p = ColorPlan::from_decoded(&d).unwrap();
+        assert!((p.scale() - 1.0 / 65535.0).abs() < 1e-12, "scale={}", p.scale());
+        assert_eq!(p.color_maximum(), 15375, "原始域白电平应被保留供报告");
+        assert_eq!(p.to_u16(1.0), 65535);
+        assert_eq!(p.to_u16(0.5), 32767);
+        assert_eq!(p.to_u16(2.0), 65535, "超量程应夹到满量程");
+        assert_eq!(p.to_u16(-1.0), 0);
     }
 
     #[test]
@@ -118,7 +159,7 @@ mod tests {
         let m: Mat3 = [[1.0, -0.8, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let d = fake(m, 1000);
         let p = ColorPlan::from_decoded(&d).unwrap();
-        let got = p.apply_u16([0, 1000, 0]);
+        let got = p.apply_u16([0, 65535, 0]);
         assert!(got[0] < 0.0, "应产生负分量而不是被截断为 0，得到 {got:?}");
         assert!((got[0] + 0.8).abs() < 1e-6);
     }
@@ -128,7 +169,7 @@ mod tests {
         let m: Mat3 = [[3.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let d = fake(m, 1000);
         let p = ColorPlan::from_decoded(&d).unwrap();
-        let got = p.apply_u16([1000, 0, 0]);
+        let got = p.apply_u16([65535, 0, 0]);
         assert!((got[0] - 3.0).abs() < 1e-5, "超色域值不应被裁到 1.0，得到 {got:?}");
     }
 
