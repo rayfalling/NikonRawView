@@ -1,0 +1,420 @@
+//! LibRaw 的 FFI 绑定与安全封装。
+//!
+//! # 绑定范围
+//!
+//! **只绑定访问接口**（`libraw_init` / `libraw_get_*` / `libraw_set_*` /
+//! `libraw_dcraw_make_mem_image`），**不复制 `libraw_data_t` 的内部结构体定义**。
+//! 那个结构体随 LibRaw 版本变化且体积庞大，在 Rust 侧复刻它意味着升级时会
+//! 静默读到错误偏移——这类错误不会崩溃，只会让数值悄悄错掉。
+//!
+//! 唯一复刻的结构是 [`ProcessedImage`]，它只有 16 字节头且是稳定接口。
+//!
+//! # 许可
+//!
+//! LibRaw 为 CDDL-1.0。源码随仓库分发于 `third_party/libraw/`，由 `build.rs` 构建。
+
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::path::Path;
+
+/// `libraw_data_t` 在 Rust 侧是不透明指针——我们不依赖它的内部布局。
+pub type Handle = *mut c_void;
+
+// ---------------------------------------------------------------------------
+// C API
+// ---------------------------------------------------------------------------
+
+extern "C" {
+    fn libraw_init(flags: c_uint) -> Handle;
+    fn libraw_close(lr: Handle);
+    fn libraw_open_file(lr: Handle, fname: *const c_char) -> c_int;
+    fn libraw_unpack(lr: Handle) -> c_int;
+    fn libraw_dcraw_process(lr: Handle) -> c_int;
+    fn libraw_dcraw_make_mem_image(lr: Handle, errc: *mut c_int) -> *mut ProcessedImage;
+    fn libraw_dcraw_clear_mem(img: *mut ProcessedImage);
+    fn libraw_strerror(code: c_int) -> *const c_char;
+    /// LibRaw 的 C 符号是驼峰命名，用 `link_name` 映射到 Rust 的蛇形命名
+    #[link_name = "libraw_versionNumber"]
+    fn libraw_version_number() -> c_int;
+
+    fn libraw_set_output_color(lr: Handle, value: c_int);
+    fn libraw_set_output_bps(lr: Handle, value: c_int);
+    fn libraw_set_gamma(lr: Handle, index: c_int, value: f32);
+    fn libraw_set_no_auto_bright(lr: Handle, value: c_int);
+    fn libraw_set_user_mul(lr: Handle, index: c_int, value: f32);
+    fn libraw_set_demosaic(lr: Handle, value: c_int);
+
+    fn libraw_get_iwidth(lr: Handle) -> c_int;
+    fn libraw_get_iheight(lr: Handle) -> c_int;
+    fn libraw_get_raw_width(lr: Handle) -> c_int;
+    fn libraw_get_raw_height(lr: Handle) -> c_int;
+    fn libraw_get_color_maximum(lr: Handle) -> c_int;
+    fn libraw_get_cam_mul(lr: Handle, index: c_int) -> f32;
+    fn libraw_get_rgb_cam(lr: Handle, i: c_int, j: c_int) -> f32;
+}
+
+/// `libraw_processed_image_t` 的头部。
+///
+/// 这是 LibRaw 的稳定 C 接口，字段与顺序由上游保证：
+/// ```c
+/// typedef struct {
+///   enum LibRaw_image_formats type;      /* int, 偏移 0  */
+///   ushort height, width, colors, bits;  /* 偏移 4,6,8,10 */
+///   unsigned int data_size;              /* 偏移 12 */
+///   unsigned char data[1];               /* 偏移 16 */
+/// } libraw_processed_image_t;
+/// ```
+#[repr(C)]
+pub struct ProcessedImage {
+    pub typ: c_int,
+    pub height: u16,
+    pub width: u16,
+    pub colors: u16,
+    pub bits: u16,
+    pub data_size: u32,
+    // 其后的 data[] 不在此结构内声明；用 data_ptr() 取
+}
+
+impl ProcessedImage {
+    /// 像素数据起点（结构体头部之后）。
+    ///
+    /// # Safety
+    /// 仅当 `self` 指向 `libraw_dcraw_make_mem_image` 的返回值时有效。
+    unsafe fn data_ptr(&self) -> *const u8 {
+        (self as *const Self as *const u8).add(std::mem::size_of::<Self>())
+    }
+}
+
+/// 输出色彩空间。取值即 LibRaw / dcraw 的 `-o` 参数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputColor {
+    /// 相机原始色彩空间，不做转换。
+    Camera = 0,
+    Srgb = 1,
+    AdobeRgb = 2,
+    WideGamut = 3,
+    /// ProPhoto（ROMM）。
+    ProPhoto = 4,
+}
+
+/// 去马赛克算法。取值即 LibRaw / dcraw 的 `-q` 参数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Demosaic {
+    Linear = 0,
+    Vng = 1,
+    Ppg = 2,
+    Ahd = 3,
+    Dcb = 4,
+    /// AHD + 色差中值滤波。
+    AhdMedian = 11,
+    Dht = 12,
+    Aahd = 13,
+}
+
+impl Demosaic {
+    pub fn name(self) -> &'static str {
+        match self {
+            Demosaic::Linear => "linear",
+            Demosaic::Vng => "vng",
+            Demosaic::Ppg => "ppg",
+            Demosaic::Ahd => "ahd",
+            Demosaic::Dcb => "dcb",
+            Demosaic::AhdMedian => "ahd-median",
+            Demosaic::Dht => "dht",
+            Demosaic::Aahd => "aahd",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    /// 无法读取文件。
+    Io(String),
+    /// LibRaw 返回了非零错误码。
+    LibRaw { code: i32, message: String },
+    /// 句柄为空。
+    NoHandle,
+    /// 输出不是预期的位图格式。
+    UnexpectedOutput { typ: i32, colors: u16, bits: u16 },
+    /// 路径含内嵌 NUL。
+    BadPath(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Io(s) => write!(f, "无法读取文件：{s}"),
+            Error::LibRaw { code, message } => write!(f, "LibRaw 错误 {code}：{message}"),
+            Error::NoHandle => write!(f, "libraw_init 返回空句柄"),
+            Error::UnexpectedOutput { typ, colors, bits } => {
+                write!(f, "输出格式非预期：type={typ} colors={colors} bits={bits}")
+            }
+            Error::BadPath(s) => write!(f, "路径含内嵌 NUL：{s}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+fn err_message(code: c_int) -> String {
+    unsafe {
+        let p = libraw_strerror(code);
+        if p.is_null() {
+            return format!("(无错误描述，code={code})");
+        }
+        CStr::from_ptr(p).to_string_lossy().into_owned()
+    }
+}
+
+fn check(code: c_int) -> Result<()> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(Error::LibRaw { code, message: err_message(code) })
+    }
+}
+
+/// LibRaw 的版本号，形如 `0x001600`。
+pub fn version_number() -> i32 {
+    unsafe { libraw_version_number() }
+}
+
+/// 版本号的点分表示。
+pub fn version_string() -> String {
+    let v = version_number();
+    format!("{}.{}.{}", v >> 16, (v >> 8) & 0xFF, v & 0xFF)
+}
+
+/// 解码选项。
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub demosaic: Demosaic,
+    /// 相机白平衡系数（R/G/B 三个乘数）；`None` 表示用文件中的白平衡。
+    pub user_mul: Option<[f32; 3]>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        // DHT 在细节与伪色之间较均衡，且对高频细节比 AHD 干净
+        Self { demosaic: Demosaic::Dht, user_mul: None }
+    }
+}
+
+/// 一次解码的结果。
+#[derive(Debug)]
+pub struct Decoded {
+    /// 输出像素的尺寸（等于 LibRaw 的 `iwidth` × `iheight`）。
+    pub width: usize,
+    pub height: usize,
+    /// 16 位线性 RGB，行主序，长度 = width × height × 3。
+    pub pixels: Vec<u16>,
+    /// 相机白平衡系数（R/G/B）。
+    pub wb: [f32; 3],
+    /// 相机 → 输出空间的 3×3 矩阵（行主序），取自 `libraw_get_rgb_cam`。
+    pub rgb_cam: [[f32; 3]; 3],
+    pub color_maximum: i32,
+    pub demosaic: Demosaic,
+    /// 传感器原始尺寸，含光学黑/掩蔽边框。
+    pub raw_width: usize,
+    pub raw_height: usize,
+}
+
+impl Decoded {
+    /// 按索引取像素，越界返回 `None`。
+    pub fn at(&self, x: usize, y: usize) -> Option<[u16; 3]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let i = (y * self.width + x) * 3;
+        Some([self.pixels[i], self.pixels[i + 1], self.pixels[i + 2]])
+    }
+
+    /// 输出是否比传感器全幅小——即为有效像素区而非含边框的全幅。
+    pub fn is_cropped(&self) -> bool {
+        self.width < self.raw_width || self.height < self.raw_height
+    }
+}
+
+/// 一个 LibRaw 句柄的 RAII 包装。
+struct Session(Handle);
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { libraw_close(self.0) };
+        }
+    }
+}
+
+/// 把一次 `libraw_dcraw_make_mem_image` 的结果拷成 Rust 侧数据。
+///
+/// # Safety
+/// `img` 必须是当前句柄最近一次 `make_mem_image` 的返回值。
+unsafe fn take_image(img: *mut ProcessedImage) -> Result<(usize, usize, Vec<u16>)> {
+    let h = &*img;
+    if h.colors != 3 || (h.bits != 8 && h.bits != 16) {
+        let r = Err(Error::UnexpectedOutput { typ: h.typ, colors: h.colors, bits: h.bits });
+        libraw_dcraw_clear_mem(img);
+        return r;
+    }
+    let w = h.width as usize;
+    let ht = h.height as usize;
+    let n = w * ht * 3;
+    let src = h.data_ptr();
+    let mut out = vec![0u16; n];
+    if h.bits == 16 {
+        for (i, o) in out.iter_mut().enumerate() {
+            let p = src.add(i * 2);
+            *o = u16::from_ne_bytes([*p, *p.add(1)]);
+        }
+    } else {
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = (*src.add(i) as u16) * 257; // 8 位按比例扩到 16 位
+        }
+    }
+    libraw_dcraw_clear_mem(img);
+    Ok((w, ht, out))
+}
+
+/// 解码一张 RAW，输出**线性相机空间**的 16 位 RGB，并取出标定元数据。
+///
+/// 关键点：输出色彩空间设为 [`OutputColor::Camera`]（不做转换）、gamma 设为线性、
+/// 关闭自动亮度——因此结果不含任何相机内观感，也仍在相机空间。转入工作空间是
+/// [`crate::color`] 的职责。
+pub fn decode_camera_linear(path: &Path, opts: &Options) -> Result<Decoded> {
+    if !path.is_file() {
+        return Err(Error::Io(format!("文件不存在：{}", path.display())));
+    }
+    let cpath = CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|_| Error::BadPath(path.display().to_string()))?;
+
+    let session = Session(unsafe { libraw_init(0) });
+    if session.0.is_null() {
+        return Err(Error::NoHandle);
+    }
+    let lr = session.0;
+
+    unsafe {
+        check(libraw_open_file(lr, cpath.as_ptr()))?;
+        check(libraw_unpack(lr))?;
+
+        if let Some(m) = opts.user_mul {
+            for (i, v) in m.iter().enumerate() {
+                libraw_set_user_mul(lr, i as c_int, *v);
+            }
+        }
+        libraw_set_demosaic(lr, opts.demosaic as c_int);
+
+        // 先以 ProPhoto 输出跑一遍，只为让 LibRaw 计算 rgb_cam 并把它取出来。
+        // rgb_cam 在 dcraw_process 内部计算，没有更廉价的取得方式。
+        libraw_set_output_color(lr, OutputColor::ProPhoto as c_int);
+        check(libraw_dcraw_process(lr))?;
+        let mut rgb_cam = [[0.0f32; 3]; 3];
+        for (i, row) in rgb_cam.iter_mut().enumerate() {
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = libraw_get_rgb_cam(lr, i as c_int, j as c_int);
+            }
+        }
+
+        // 再以相机空间输出跑第二遍，取未做色彩转换的线性像素
+        libraw_set_output_color(lr, OutputColor::Camera as c_int);
+        libraw_set_output_bps(lr, 16);
+        libraw_set_gamma(lr, 0, 1.0);
+        libraw_set_gamma(lr, 1, 1.0);
+        libraw_set_no_auto_bright(lr, 1);
+        check(libraw_dcraw_process(lr))?;
+
+        let mut errc: c_int = 0;
+        let img = libraw_dcraw_make_mem_image(lr, &mut errc);
+        if img.is_null() {
+            return Err(Error::LibRaw { code: errc, message: err_message(errc) });
+        }
+        let (width, height, pixels) = take_image(img)?;
+
+        let wb = [
+            libraw_get_cam_mul(lr, 0),
+            libraw_get_cam_mul(lr, 1),
+            libraw_get_cam_mul(lr, 2),
+        ];
+        let color_maximum = libraw_get_color_maximum(lr);
+        // 尺寸一律经由 LibRaw 的访问接口取得，不用自己解析标签
+        let iwidth = libraw_get_iwidth(lr).max(0) as usize;
+        let iheight = libraw_get_iheight(lr).max(0) as usize;
+        let raw_width = libraw_get_raw_width(lr).max(0) as usize;
+        let raw_height = libraw_get_raw_height(lr).max(0) as usize;
+
+        let d = Decoded {
+            width,
+            height,
+            pixels,
+            wb,
+            rgb_cam,
+            color_maximum,
+            demosaic: opts.demosaic,
+            raw_width,
+            raw_height,
+        };
+        // iwidth/iheight 应与实际像素尺寸一致；不一致说明解码层行为有变，值得暴露
+        debug_assert!(
+            iwidth == d.width && iheight == d.height,
+            "iwidth×iheight ({iwidth}×{iheight}) 与实际输出 ({}×{}) 不一致",
+            d.width,
+            d.height
+        );
+        Ok(d)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_against_libraw() {
+        let v = version_string();
+        assert_eq!(version_number() >> 16, 0, "LibRaw 主版本应为 0，得到 {v}");
+        assert!(version_number() > 0, "版本号应非零");
+        eprintln!("LibRaw {v} (0x{:06X})", version_number());
+    }
+
+    #[test]
+    fn missing_file_is_io_error() {
+        let e = decode_camera_linear(Path::new("no-such-file.nef"), &Options::default());
+        assert!(matches!(e, Err(Error::Io(_))), "得到 {e:?}");
+    }
+
+    #[test]
+    fn garbage_file_fails_explicitly() {
+        let p = std::env::temp_dir().join("nikonrawview-garbage.nef");
+        std::fs::write(&p, vec![0xAAu8; 4096]).unwrap();
+        let e = decode_camera_linear(&p, &Options::default());
+        let _ = std::fs::remove_file(&p);
+        match e {
+            Err(Error::LibRaw { message, .. }) => {
+                assert!(!message.is_empty(), "错误描述不应为空");
+                eprintln!("损坏文件错误描述：{message}");
+            }
+            other => panic!("应返回 LibRaw 错误，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn demosaic_names_are_distinct() {
+        let all = [
+            Demosaic::Linear,
+            Demosaic::Vng,
+            Demosaic::Ppg,
+            Demosaic::Ahd,
+            Demosaic::Dcb,
+            Demosaic::AhdMedian,
+            Demosaic::Dht,
+            Demosaic::Aahd,
+        ];
+        let mut names: Vec<&str> = all.iter().map(|d| d.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), all.len());
+    }
+}

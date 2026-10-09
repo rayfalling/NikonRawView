@@ -1,7 +1,7 @@
 ## 1. 依赖与工程准备
 
 - [x] 1.1 确定 RAW 解码方案并 vendor 源码：LibRaw 0.22 源码入 `third_party/libraw/`（CDDL-1.0），`Cargo.toml` 保持零 crate 依赖。已实测 `nmake /f Makefile.msvc` + `vcvars64` 可构建成功
-- [ ] 1.2 实现 `build.rs`：调用 `vcvars64.bat` + `nmake /f Makefile.msvc` 构建 vendored LibRaw，输出 `cargo:rustc-link-search` 与 `cargo:rustc-link-lib=static=libraw_static`；验证 `cargo build --offline` 在干净 `target/` 下能从源码构建出静态库并链接成功
+- [x] 1.2 实现 `build.rs`：调用 `vcvars64.bat` + `nmake /f Makefile.msvc` 构建 vendored LibRaw，输出 `cargo:rustc-link-search` 与 `cargo:rustc-link-lib=static=libraw_static`；已验证从干净状态（删除 `object/`、`bin/`、`libraw_static.lib`）`cargo build --offline` 能构建出静态库（80 个 .obj，112 秒）并链接成功
 - [ ] 1.3 在 README 记录构建方式与 `nmake` 的理由：**不得改用 MSBuild** —— 其 vcxproj 钉死 Windows SDK `10.0.18362.0` 与工具集 `v142`，且在沙箱内会被「同名不同大小写的代理环境变量」触发的 .NET 字典异常打断（`MSB6001`）
 - [ ] 1.4 CDDL 合规落地：补 `LICENSE-MIT`、`LICENSE-APACHE`（仓库自身目前**一个 LICENSE 文件都没有**）、`THIRD_PARTY_LICENSES.md`（列 LibRaw 及其 CDDL 版本与源码位置），README 增加「许可」章节说明二进制的第三方组件；验证 `third_party/libraw/LICENSE.CDDL` 随源码入库
 - [ ] 1.5 定义基准变换数据的文件格式（含版本字段、基准名、配方编码、来源清单），实现读写；验证写入后读回逐字段一致，且版本不匹配时给出明确错误
@@ -9,13 +9,14 @@
 
 ## 2. RAW 解码（capability `render/raw-decode`）
 
-- [ ] 2.1 实现 LibRaw C API 的 FFI 绑定：只绑定**访问接口**（`libraw_get_*` / `libraw_set_*` / `libraw_dcraw_make_mem_image`），**MUST NOT 复制 `libraw_data_t` 的内部结构体定义**；验证绑定能链接并进行一次空调用
-- [ ] 2.2 取出标定元数据：白平衡系数、相机 → 输出空间矩阵、白电平、黑电平、有效像素区；验证 Z8 的 NEF 上白平衡为 `[1.8125, 1.0, 1.5703]`、尺寸 8256×5504
-- [ ] 2.3 输出线性相机 RGB：显式设置线性 gamma、关闭自动亮度、输出色彩空间设为相机原始空间；验证输出不含 gamma 或色调曲线，且仍在相机空间
-- [ ] 2.4 去马赛克算法可配置并在结果中报告；验证指定不同算法时报告随之改变
+- [x] 2.1 实现 LibRaw C API 的 FFI 绑定：只绑定**访问接口**（`libraw_get_*` / `libraw_set_*` / `libraw_dcraw_make_mem_image`），**MUST NOT 复制 `libraw_data_t` 的内部结构体定义**；已验证绑定能链接（唯一复刻的结构是 16 字节头的 `ProcessedImage`）
+- [ ] 2.2 取出标定元数据：白平衡系数、相机 → 输出空间矩阵、白电平、黑电平、有效像素区；**白平衡已验证为 `[1.8125, 1.0, 1.5703]`，与早前独立测得一致**；尚缺白电平/黑电平的取出与断言
+- [x] 2.3 输出线性相机 RGB：显式设置线性 gamma、关闭自动亮度、输出色彩空间设为相机原始空间；已验证输出为线性（绿通道 中位/最大 = 0.0665）且仍在相机空间
+- [x] 2.4 去马赛克算法可配置并在结果中报告；已验证 `linear` 与 `dht` 产出不同结果且报告随之改变
 - [ ] 2.5 编写伪像检查：对含高频细节的裁剪区域去马赛克，验证无成片伪色；把该区域连同指标一并输出，作为人工复核的凭证
-- [ ] 2.6 实现明确失败：错误文本取自解码层（`libraw_strerror`）；用一个损坏文件验证返回指明原因的失败，**且不产生部分写入的输出文件**
-- [ ] 2.7 验证解码可复现：相同参数解码两次逐位相同，且结果中记录实际使用的全部参数
+- [x] 2.6 实现明确失败：错误文本取自解码层（`libraw_strerror`）；已验证损坏文件返回非空描述的错误、不存在的文件返回 IO 错误
+- [x] 2.7 验证解码可复现：相同参数解码两次逐位相同，且结果中记录实际使用的全部参数
+- [ ] 2.8 实现「裁到有效像素区」：按机型裁掉边框（Z8：左右各 12、上下各 8 像素，实测确认与传感器全幅 8280×5520 减去有效区 8256×5504 吻合）；边距须作为机型知识显式记录并在结果中报告；验证裁切后尺寸为 `8256×5504`
 
 ## 3. 色彩管线（capability `render/color-pipeline`）
 

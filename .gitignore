@@ -79,6 +79,9 @@ temp/
 # 但构建产物不入库——由 build.rs 从源码生成。
 third_party/libraw/object/
 third_party/libraw/bin/
+third_party/libraw/lib/*.lib
+third_party/libraw/lib/*.exp
+third_party/libraw/lib/*.a
 *.ppm
 *.pgm
 

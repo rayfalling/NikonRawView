@@ -14,6 +14,7 @@
 
 pub mod error;
 pub mod library;
+pub mod libraw;
 pub mod makernote;
 pub mod mat3;
 pub mod np3;
