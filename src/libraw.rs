@@ -387,7 +387,8 @@ mod tests {
 
     #[test]
     fn garbage_file_fails_explicitly() {
-        let p = std::env::temp_dir().join("nikonrawview-garbage.nef");
+        // 文件名带进程号：`cargo test` 会并行跑多个测试二进制，固定文件名会互相踩
+        let p = std::env::temp_dir().join(format!("nikonrawview-garbage-{}.nef", std::process::id()));
         std::fs::write(&p, vec![0xAAu8; 4096]).unwrap();
         let e = decode_camera_linear(&p, &Options::default());
         let _ = std::fs::remove_file(&p);
