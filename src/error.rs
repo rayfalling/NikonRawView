@@ -23,6 +23,8 @@ pub enum Error {
     NotRecipeContainer([u8; 4]),
     /// 配方名在配方库中不存在。
     RecipeNotFound(String),
+    /// 渲染管线的前置条件不满足（输入不自洽，或缺少必需的数据）。
+    InvalidInput(String),
 }
 
 impl fmt::Display for Error {
@@ -38,6 +40,7 @@ impl fmt::Display for Error {
             Error::BadByteOrder(b) => write!(f, "非法字节序标记：{b:02X?}"),
             Error::NotRecipeContainer(m) => write!(f, "非配方容器，magic = {m:02X?}"),
             Error::RecipeNotFound(n) => write!(f, "配方库中未找到配方：{n}"),
+            Error::InvalidInput(s) => write!(f, "输入不满足渲染前置条件：{s}"),
         }
     }
 }

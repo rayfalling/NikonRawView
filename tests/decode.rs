@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use nikonrawview::libraw::{self, Demosaic, Options};
+use nikonrawview::camera;
 
 fn samples_dir() -> PathBuf {
     std::env::var_os("NIKONRAWVIEW_SAMPLES")
@@ -152,4 +153,53 @@ fn decoding_is_reproducible() {
     assert_eq!(a.pixels, b.pixels, "两次解码应逐位相同");
     assert_eq!(a.rgb_cam, b.rgb_cam);
     assert_eq!(a.wb, b.wb);
+}
+
+/// 裁切：机型从文件读出，边距取自机型表，开关两种状态都要验证。
+#[test]
+fn crop_toggle_yields_expected_sizes() {
+    let path = samples_dir().join("DSC_4143.NEF");
+    if !path.is_file() {
+        eprintln!("跳过：未找到 {}", path.display());
+        return;
+    }
+
+    let model = camera::read_model(&path).expect("应能从 IFD0 读出机型");
+    eprintln!("从 IFD0 读出的机型：{model:?}");
+    assert_eq!(camera::lookup(&model).map(|m| m.display), Some("Nikon Z 8"));
+
+    let d = libraw::decode_camera_linear(&path, &Options::default()).unwrap();
+    assert_eq!((d.width, d.height), (8280, 5520), "解码层给出传感器全幅");
+
+    // 开关关闭：保留全幅
+    let off = camera::decide(&model, d.width, d.height, false);
+    assert_eq!(off, camera::CropDecision::Disabled);
+    let (px, w, h) = camera::apply(&d.pixels, d.width, d.height, &off);
+    assert_eq!((w, h), (8280, 5520));
+    assert_eq!(px.len(), d.pixels.len());
+    eprintln!("  开关关闭 → {w}×{h}  {}", off.describe());
+
+    // 开关开启：裁到有效像素区
+    let on = camera::decide(&model, d.width, d.height, true);
+    assert!(matches!(on, camera::CropDecision::Cropped { .. }), "得到 {on:?}");
+    let (px, w, h) = camera::apply(&d.pixels, d.width, d.height, &on);
+    assert_eq!((w, h), (8256, 5504), "裁切后应为 Z8 的有效像素区");
+    assert_eq!(px.len(), w * h * 3);
+    eprintln!("  开关开启 → {w}×{h}  {}", on.describe());
+
+    // 裁切后的首像素应等于原图 (12, 8) 处
+    let src = d.at(12, 8).unwrap();
+    assert_eq!([px[0], px[1], px[2]], src, "裁切起点应为左上角边距处");
+}
+
+/// 机型不在边距表中时不猜边距。
+#[test]
+fn unknown_model_does_not_guess_margins() {
+    let d = camera::decide("Canon EOS R5", 8280, 5520, true);
+    assert!(matches!(d, camera::CropDecision::UnknownModel { .. }), "得到 {d:?}");
+    assert!(d.describe().contains("机型不在边距表中"));
+    let px = vec![1u16; 4 * 4 * 3];
+    let (out, w, h) = camera::apply(&px, 4, 4, &d);
+    assert_eq!((w, h), (4, 4), "未知机型应原样返回而非裁切");
+    assert_eq!(out.len(), px.len());
 }
