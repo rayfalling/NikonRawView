@@ -61,6 +61,15 @@ impl ColorPlan {
         })
     }
 
+    /// 由**推导**出的矩阵构造（见 [`derive_matrix`]）。
+    ///
+    /// 与 [`Self::from_decoded`] 的区别：那条走解码层的相机矩阵访问接口，而实测该
+    /// 接口返回的矩阵与输出色彩空间无关、并非实际参与转换的那个；这条用的是自己
+    /// 测出来的矩阵。
+    pub fn from_derived(matrix: Mat3, full_scale: f32) -> Self {
+        Self { matrix, scale: 1.0 / full_scale, color_maximum: full_scale as i32 }
+    }
+
     /// 矩阵本身，供结果记录与手工复核。
     pub fn matrix(&self) -> Mat3 {
         self.matrix
@@ -109,10 +118,168 @@ impl ColorPlan {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 相机矩阵的推导
+// ---------------------------------------------------------------------------
+
+/// 最小二乘推导出的相机矩阵及其拟合质量。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DerivedMatrix {
+    /// 相机 → 工作空间的 3×3 矩阵。
+    pub matrix: Mat3,
+    /// 参与拟合的样本数。
+    pub samples: usize,
+    /// 残差的均方根（单位与样本同为 0..1）。
+    pub rms: f64,
+    /// 最大绝对残差。
+    pub max_abs: f64,
+}
+
+/// 由「相机空间像素 ↔ 工作空间像素」配对最小二乘求出相机矩阵。
+///
+/// # 为什么这样求是可行的
+///
+/// 实测相机矩阵**按机型固定、不随拍摄白平衡变化**（`DSC_4569` 与 `DSC_5157` 的
+/// 白平衡系数差异和 0.6152，而矩阵差异和 0.000000）。因此每个机型只需测一次，
+/// 之后所有同机型照片共用——这也正是"自己推导"能成立的前提。
+///
+/// # 为什么不能直接问解码层要
+///
+/// 解码层确实有一个「相机 → 输出空间」的访问接口，但它返回的矩阵与输出色彩空间
+/// **无关**（Camera / sRGB / ProPhoto 三种输出下逐位相同），而像素却随输出色彩空间
+/// 变化——说明那不是实际参与转换的矩阵。与其复刻其内部数据，不如**测**出来。
+///
+/// # 求解方式
+///
+/// 对每个输出通道解一个三元最小二乘：`min Σ (p_k − m_k·c)²`，正规方程
+/// `(Σ c cᵀ) m_k = Σ c p_k`。三个通道共用同一个 3×3 正规矩阵，只需求一次逆。
+///
+/// 样本应**只保留双方都未饱和的点**——饱和处解码层做过裁切，把它们算进拟合会把
+/// 裁切行为误当成矩阵的一部分。
+pub fn derive_matrix(pairs: &[([f32; 3], [f32; 3])]) -> Option<DerivedMatrix> {
+    if pairs.len() < 3 {
+        return None;
+    }
+
+    // 正规矩阵 S = Σ c cᵀ（对称），以及右端项 B[k] = Σ c · p_k
+    let mut s = [[0f64; 3]; 3];
+    let mut b = [[0f64; 3]; 3];
+    for (c, p) in pairs {
+        let c = [c[0] as f64, c[1] as f64, c[2] as f64];
+        for i in 0..3 {
+            for j in 0..3 {
+                s[i][j] += c[i] * c[j];
+            }
+            for k in 0..3 {
+                b[k][i] += c[i] * p[k] as f64;
+            }
+        }
+    }
+
+    // 用 f64 版的高斯-约当求逆；这里不复用 f32 的 mat3::inverse 以免精度损失
+    let inv = invert3_f64(s)?;
+    let mut m = [[0f32; 3]; 3];
+    for k in 0..3 {
+        for i in 0..3 {
+            let v: f64 = (0..3).map(|j| inv[i][j] * b[k][j]).sum();
+            m[k][i] = v as f32;
+        }
+    }
+
+    // 残差
+    let mut sum_sq = 0f64;
+    let mut max_abs = 0f64;
+    let mut n = 0usize;
+    for (c, p) in pairs {
+        let pred = mat3::mul_vec(m, *c);
+        for k in 0..3 {
+            let e = (pred[k] - p[k]).abs() as f64;
+            sum_sq += e * e;
+            max_abs = max_abs.max(e);
+            n += 1;
+        }
+    }
+    let rms = (sum_sq / n.max(1) as f64).sqrt();
+
+    Some(DerivedMatrix { matrix: m, samples: pairs.len(), rms, max_abs })
+}
+
+fn invert3_f64(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if det.abs() < 1e-18 {
+        return None;
+    }
+    let d = 1.0 / det;
+    Some([
+        [
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * d,
+            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * d,
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * d,
+        ],
+        [
+            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * d,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * d,
+            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * d,
+        ],
+        [
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * d,
+            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * d,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * d,
+        ],
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::libraw::{Decoded, Demosaic};
+
+    #[test]
+    fn derive_recovers_a_known_matrix() {
+        // 造一组由已知矩阵生成的配对，验证能解回来
+        let truth: Mat3 = [[1.3, -0.2, -0.1], [-0.15, 1.4, -0.25], [-0.02, -0.3, 1.32]];
+        let mut pairs = Vec::new();
+        for i in 0..40 {
+            for j in 0..40 {
+                let c = [i as f32 / 40.0, j as f32 / 40.0, ((i + j) % 40) as f32 / 40.0];
+                let p = mat3::mul_vec(truth, c);
+                pairs.push((c, p));
+            }
+        }
+        let d = derive_matrix(&pairs).expect("应能求解");
+        assert_eq!(d.samples, 1600);
+        assert!(d.rms < 1e-6, "rms={}", d.rms);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (d.matrix[i][j] - truth[i][j]).abs() < 1e-4,
+                    "[{i}][{j}] {} vs {}",
+                    d.matrix[i][j],
+                    truth[i][j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn derive_needs_enough_samples() {
+        assert!(derive_matrix(&[]).is_none());
+        assert!(derive_matrix(&[([0.1, 0.2, 0.3], [0.1, 0.2, 0.3])]).is_none());
+    }
+
+    #[test]
+    fn derive_rejects_degenerate_samples() {
+        // 所有样本共线 → 正规矩阵奇异
+        let pairs: Vec<_> = (0..50)
+            .map(|i| {
+                let c = [i as f32 / 50.0, 0.0, 0.0];
+                (c, c)
+            })
+            .collect();
+        assert!(derive_matrix(&pairs).is_none(), "退化样本应返回 None 而非胡乱给一个矩阵");
+    }
 
     fn fake(matrix: Mat3, color_maximum: i32) -> Decoded {
         Decoded {

@@ -433,7 +433,117 @@ fn camera_matrix_varies_with_white_balance() {
     assert!(b.rgb_cam.iter().flatten().all(|v| v.is_finite()));
 }
 
-/// 3.3 的诊断：判定 `output_color` 是否真的生效。
+/// 路线 B 的验证：相机矩阵能否**测**出来，并在另一张图上成立。
+///
+/// 前提来自 3.1 的实测——矩阵按机型固定、不随拍摄白平衡变化，所以每个机型只需测一次。
+/// 若本测试通过，`render/color-pipeline` 就可以保留「由本管线施加矩阵」，同时拿回
+/// 色域裁切与负值的控制权。
+#[test]
+fn derived_matrix_generalises_across_images() {
+    let root = std::env::var("NIKONRAWVIEW_LIBRARY")
+        .ok()
+        .map(std::path::PathBuf::from);
+    let first = samples_dir().join("DSC_4143.NEF");
+    if !first.is_file() {
+        eprintln!("跳过：未找到 {}", first.display());
+        return;
+    }
+
+    let pair_of = |p: &std::path::Path| -> (libraw::Decoded, libraw::Decoded) {
+        let o = Options { demosaic: Demosaic::Linear, user_mul: None };
+        let cam = libraw::decode_with_output_for_test(p, &o, libraw::OutputColor::Camera).unwrap();
+        let pro =
+            libraw::decode_with_output_for_test(p, &o, libraw::OutputColor::ProPhoto).unwrap();
+        (cam, pro)
+    };
+
+    let samples = |cam: &libraw::Decoded, pro: &libraw::Decoded| -> Vec<([f32; 3], [f32; 3])> {
+        let mut v = Vec::new();
+        for i in (0..cam.pixels.len()).step_by(3 * 7) {
+            let c = [cam.pixels[i], cam.pixels[i + 1], cam.pixels[i + 2]];
+            let p = [pro.pixels[i], pro.pixels[i + 1], pro.pixels[i + 2]];
+            // 排除任何一侧的饱和点：那里解码层做过裁切，会把裁切行为误当成矩阵
+            if c.iter().any(|x| *x == 0 || *x == u16::MAX)
+                || p.iter().any(|x| *x == 0 || *x == u16::MAX)
+            {
+                continue;
+            }
+            let f = |a: [u16; 3]| [a[0] as f32 / 65535.0, a[1] as f32 / 65535.0, a[2] as f32 / 65535.0];
+            v.push((f(c), f(p)));
+        }
+        v
+    };
+
+    let (cam_a, pro_a) = pair_of(&first);
+    let pairs_a = samples(&cam_a, &pro_a);
+    eprintln!("推导样本数 = {}", pairs_a.len());
+    let derived = nikonrawview::color::derive_matrix(&pairs_a).expect("应能求出矩阵");
+    eprintln!(
+        "推导矩阵（{} 样本，rms={:.6}，max={:.6}）：",
+        derived.samples, derived.rms, derived.max_abs
+    );
+    for row in &derived.matrix {
+        eprintln!("    [{:>9.5} {:>9.5} {:>9.5}]", row[0], row[1], row[2]);
+    }
+
+    // 在**推导所用的同一张图**上，残差应落在这条矩阵的解释能力之内
+    assert!(
+        derived.rms < 0.01,
+        "同图拟合的 rms={:.6} 过大，说明相机→工作空间的映射不是线性的",
+        derived.rms
+    );
+
+    // 换一张图复验
+    let Some(root) = root else {
+        eprintln!("未设置 NIKONRAWVIEW_LIBRARY，跳过跨图复验");
+        return;
+    };
+    let mut second = None;
+    let mut stack = vec![root];
+    'find: while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("nef"))
+                && p.file_name() != first.file_name()
+            {
+                second = Some(p);
+                break 'find;
+            }
+        }
+    }
+    let Some(second) = second else {
+        eprintln!("未找到第二张 NEF，跳过跨图复验");
+        return;
+    };
+    eprintln!("复验用图：{}", second.file_name().unwrap().to_string_lossy());
+
+    let (cam_b, pro_b) = pair_of(&second);
+    let pairs_b = samples(&cam_b, &pro_b);
+    let plan = ColorPlan::from_derived(derived.matrix, 65535.0);
+    let mut sum = 0f64;
+    let mut worst = 0f64;
+    let mut n = 0u64;
+    for (c, p) in &pairs_b {
+        let ours = plan.apply(*c);
+        for k in 0..3 {
+            let e = (ours[k] - p[k]).abs() as f64;
+            sum += e;
+            worst = worst.max(e);
+            n += 1;
+        }
+    }
+    let mean = sum / n.max(1) as f64;
+    eprintln!("跨图复验（{} 样本）：平均绝对差 {mean:.6}，最大 {worst:.6}", pairs_b.len());
+
+    assert!(n > 1000, "复验样本太少（{n}）");
+    assert!(
+        mean < 0.005,
+        "推导出的矩阵在另一张图上平均绝对差 {mean:.6}——若显著偏大，说明矩阵并非按机型固定，路线 B 不成立"
+    );
+}
 ///
 /// 假设是「输出色彩空间没被应用」——若如此，`Camera` 与 `ProPhoto` 两条路径的像素
 /// 会几乎相同，而它们的 `rgb_cam` 却不相同。
