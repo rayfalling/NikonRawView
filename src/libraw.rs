@@ -439,6 +439,15 @@ pub fn decode_working_space(path: &Path, opts: &Options) -> Result<Decoded> {
     decode_with_output(path, opts, OutputColor::ProPhoto)
 }
 
+/// 以任意输出色彩空间解码，供诊断与交叉验证使用。
+pub fn decode_with_output_for_test(
+    path: &Path,
+    opts: &Options,
+    output: OutputColor,
+) -> Result<Decoded> {
+    decode_with_output(path, opts, output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

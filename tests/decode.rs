@@ -433,31 +433,92 @@ fn camera_matrix_varies_with_white_balance() {
     assert!(b.rgb_cam.iter().flatten().all(|v| v.is_finite()));
 }
 
+/// 3.3 的诊断：判定 `output_color` 是否真的生效。
+///
+/// 假设是「输出色彩空间没被应用」——若如此，`Camera` 与 `ProPhoto` 两条路径的像素
+/// 会几乎相同，而它们的 `rgb_cam` 却不相同。
+#[test]
+#[ignore = "诊断用，手动运行"]
+fn diagnose_output_color_takes_effect() {
+    let path = samples_dir().join("DSC_4143.NEF");
+    if !path.is_file() {
+        eprintln!("跳过：未找到 {}", path.display());
+        return;
+    }
+    let opts = Options { demosaic: Demosaic::Linear, user_mul: None };
+
+    let cam = libraw::decode_with_output_for_test(&path, &opts, libraw::OutputColor::Camera).unwrap();
+    let srgb = libraw::decode_with_output_for_test(&path, &opts, libraw::OutputColor::Srgb).unwrap();
+    let pro = libraw::decode_with_output_for_test(&path, &opts, libraw::OutputColor::ProPhoto).unwrap();
+
+    let diff = |a: &libraw::Decoded, b: &libraw::Decoded| -> f64 {
+        let mut s = 0f64;
+        let mut n = 0u64;
+        for i in (0..a.pixels.len()).step_by(3 * 397) {
+            for k in 0..3 {
+                s += (a.pixels[i + k] as f64 - b.pixels[i + k] as f64).abs();
+                n += 1;
+            }
+        }
+        s / n as f64
+    };
+
+    let mc = |m: [[f32; 3]; 3]| {
+        format!(
+            "[{:.4} {:.4} {:.4}]",
+            m[0][0], m[0][1], m[0][2]
+        )
+    };
+
+    eprintln!("=== output_color 生效性诊断 ===");
+    eprintln!("Camera  rgb_cam 第 0 行: {}", mc(cam.rgb_cam));
+    eprintln!("sRGB    rgb_cam 第 0 行: {}", mc(srgb.rgb_cam));
+    eprintln!("ProPhoto rgb_cam 第 0 行: {}", mc(pro.rgb_cam));
+    eprintln!();
+    eprintln!("像素平均绝对差（16 位刻度）：");
+    eprintln!("  Camera  vs sRGB    : {:.1}", diff(&cam, &srgb));
+    eprintln!("  Camera  vs ProPhoto: {:.1}", diff(&cam, &pro));
+    eprintln!("  sRGB    vs ProPhoto: {:.1}", diff(&srgb, &pro));
+    eprintln!();
+    eprintln!("cam 输出前几个像素 : {:?}", &cam.pixels[..9.min(cam.pixels.len())]);
+    eprintln!("pro 输出前几个像素 : {:?}", &pro.pixels[..9.min(pro.pixels.len())]);
+}
+
 /// 任务 3.3：交叉验证——本管线自行施加矩阵，应与解码层直接输出工作空间一致。
 ///
-/// # 当前状态：**未通过，原因待查**
+/// # 当前状态：**未通过，但原因已定位**
 ///
-/// 实测（`DSC_4143.NEF`，137526 个在色域内的分量）：
+/// 实测（`DSC_4143.NEF`，137526 个在色域内的分量）：施加矩阵平均绝对差 0.008406，
+/// 不施加矩阵 0.003888——**"什么都不做"反而更接近**。
+///
+/// ## 原因：`libraw_get_rgb_cam` 返回的不是实际使用的矩阵
+///
+/// 诊断（`diagnose_output_color_takes_effect`）在同一个文件上比较三种输出空间：
 ///
 /// ```text
-/// 施加相机矩阵：平均绝对差 0.008406
-/// 不施加矩阵  ：平均绝对差 0.003888   ← 反而更小
+/// Camera  rgb_cam: [1.3931 -0.2157 -0.1774]
+/// sRGB    rgb_cam: [1.3931 -0.2157 -0.1774]   ← 三者完全相同
+/// ProPhoto rgb_cam: [1.3931 -0.2157 -0.1774]
+///
+/// 像素平均绝对差（16 位刻度）：
+///   Camera vs sRGB    : 362.1
+///   Camera vs ProPhoto: 254.7                  ← 像素确实随输出空间变化
+///   sRGB   vs ProPhoto: 550.5
 /// ```
 ///
-/// **"什么都不做"比"施加矩阵"更接近解码层的输出**，说明本管线的矩阵施加没有复现
-/// 解码层的内部转换。在原因查清之前，本测试保持 `#[ignore]`——它是一条记录在案的
-/// 问题，不是一条假装通过的绿灯。
+/// 即：**矩阵与输出色彩空间无关，而像素随输出色彩空间变化**。因此该访问接口给出的
+/// 矩阵不是 `convert_to_rgb` 实际使用的那个，本管线"取矩阵自行施加"的做法建立在
+/// 一个错误的前提上。
 ///
-/// 注意 `rgb_cam` 的三行行和均为 1.0（矩阵只改色度、不改中性），因此画面越接近
-/// 中性，两种做法的差异越小；这条对照之所以有判别力，正是靠这一点。
+/// ## 待定的两条出路（需先定路线再改 spec）
 ///
-/// 待查方向：
-/// - 解码层是否在矩阵之外还做了白平衡归一化（其内部 `pre_mul` 的用法与
-///   `libraw_get_cam_mul` 返回的值是否同一套刻度）
-/// - `libraw_get_rgb_cam` 取的是否就是 `convert_to_rgb` 实际使用的那个矩阵
-/// - 解码层是否在施加矩阵前对相机值做了额外缩放
+/// 1. **由解码层做转换**：直接取 `output_color = ProPhoto` 的像素，本管线不再自行
+///    施加矩阵。正确性有保障，代价是解码层会就地裁到 0..65535——`render/color-pipeline`
+///    中「不提前裁切色域、不截断负值」这条需要相应改写。
+/// 2. **自行算出正确的矩阵**：从解码层的机型标定推导。但该标定未经 C API 暴露，
+///    等于要复刻其内部数据——与本项目「不依赖解码层内部结构」的原则冲突。
 #[test]
-#[ignore = "交叉验证发现未解释的残差：施加矩阵(0.0084)反而不如不施加(0.0039)，原因待查"]
+#[ignore = "原因已定位：libraw_get_rgb_cam 返回的矩阵与输出色彩空间无关，不是实际使用的那个；待定路线后修正"]
 fn color_pipeline_matches_decoder_working_space() {
     let path = samples_dir().join("DSC_4143.NEF");
     if !path.is_file() {
