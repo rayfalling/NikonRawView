@@ -15,6 +15,7 @@
 pub mod error;
 pub mod library;
 pub mod makernote;
+pub mod mat3;
 pub mod np3;
 pub mod picture_control;
 pub mod tiff;

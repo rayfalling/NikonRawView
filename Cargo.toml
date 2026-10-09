@@ -16,5 +16,11 @@ name = "nikon-pc"
 path = "src/main.rs"
 
 # 解析层零依赖：TIFF/IFD 与 NP3 chunk 遍历均自行实现。
-# 见 openspec/changes/add-picture-control-parsing/design.md 决策七、决策八。
+# 见 openspec/specs/ 中 nef/picture-control 与 picture-control/np3。
+#
+# 渲染管线的 RAW 解码使用 LibRaw（third_party/libraw/，CDDL-1.0），
+# 以 build.rs 构建 + 手写 FFI 绑定接入，因此 [dependencies] 仍为空。
+# 见 openspec/changes/add-nikon-render-pipeline/design.md 决策一。
+#
+# 注：曾评估 rawler（纯 Rust），因其为 LGPL-2.1 而改用 CDDL 的 LibRaw。
 [dependencies]
