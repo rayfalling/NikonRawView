@@ -468,15 +468,38 @@ mod tests {
 
     /// 损坏文件必须给出**确定的失败**，而不是崩溃或产出图像。
     ///
-    /// 断言不限定具体错误变体：解码层在不同情况下可能报"不支持的格式"或
-    /// 在更早一步就失败，两者都是合格的"确定失败"。曾经断言必须是 `LibRaw`
-    /// 变体，导致一条**偶发**失败（十次里偶现一次，未能稳定复现）——把它放宽到
-    /// 真正要验的性质，同时把实际变体打印出来，异常时仍有据可查。
+    /// 断言不限定具体错误变体：解码层在不同情况下可能报"不支持的格式"，也可能在
+    /// 更早一步失败，两者都是合格的"确定失败"。
+    ///
+    /// # 这条测试曾经偶发失败，根因不在解码
+    ///
+    /// 失败点是 `std::fs::write` 本身，不是解码。根因有两条，都已修：
+    ///
+    /// 1. 临时文件名原先只带进程号——`cargo test` 并行跑多个测试二进制时可能相撞。
+    ///    现掺入纳秒时间戳。
+    /// 2. **本机的 `%TEMP%` 不可写**：`std::fs::write` 报 `拒绝访问 (os error 5)`。
+    ///    沙箱有时把 `TEMP` 指到会话专有的可写目录、有时指到真实 temp，于是表现为
+    ///    "偶发"。现改为写进 cargo 的 `target/` 目录——那是构建产物目录，必然可写，
+    ///    且已在 `.gitignore` 里。
     #[test]
     fn garbage_file_fails_explicitly() {
-        let p = std::env::temp_dir()
-            .join(format!("nikonrawview-garbage-{}.nef", std::process::id()));
-        std::fs::write(&p, vec![0xAAu8; 4096]).unwrap();
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+
+        // 不用 temp_dir()：本机的 %TEMP% 拒绝写入（os error 5）
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&dir).expect("应能创建 target 目录");
+        let p = dir.join(format!(
+            "garbage-{}-{}.nef",
+            std::process::id(),
+            nanos
+        ));
+        if let Err(e) = std::fs::write(&p, vec![0xAAu8; 4096]) {
+            panic!("写入临时文件失败：{e}（路径 {}）", p.display());
+        }
         assert!(p.is_file(), "临时文件应已写入：{}", p.display());
         let e = decode_camera_linear(&p, &Options::default());
         let _ = std::fs::remove_file(&p);
