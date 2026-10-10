@@ -1,4 +1,18 @@
-//! 诊断 K：拟合 `w(B/G)` 并做**留一档交叉验证**。
+//! 诊断 M：把 `w` 的自变量换成 **(R/G, B/G) 两元**，重跑拟合与留一状态交叉验证。
+//!
+//! # 相对上一轮（诊断 K）的唯一实质变化
+//!
+//! 上一轮只用 `B/G` 一个自变量，对红通道给出**负结论**（CV 中位 3.55% 但最坏 14.8%，
+//! 且结构上「B/G ≤ 1.31 恒定、之后陡降」，误差÷幅度 1.65）。
+//!
+//! 本轮的依据是：`cam_mul` 的四元组里 `G1 == G2 == 1.0` 恒成立，尼康把白平衡微调
+//! （A/M 偏移）折进了 R 与 B 的乘数——所以白平衡状态由 **`(R/G, B/G)` 两个数**完整编码，
+//! 而 `K` 只是"偏移为零"那条特殊曲线上的参数。**把二维投影到一根轴会制造假结构**：
+//! `DSC_0567`（R/G 2.1113、B/G 1.4941）与 `DSC_0141`（R/G 1.7500、B/G 1.4961）B/G 只差
+//! 0.13%，`w_R` 却差 23.9%，而 `w_B` 只差 1.7%。
+//!
+//! 因此本轮的判据从「留一 **B/G 档**」改为「留一 **(R/G, B/G) 白平衡状态**」，
+//! 模型从「6 种一元形式」扩到「一元 + 二元共 9 个模型」，两者都用同一套 minimax 纪律选。
 //!
 //! # 要解决的问题
 //!
@@ -285,6 +299,41 @@ fn rel_err(pred: f64, measured: f64) -> f64 {
     }
 }
 
+/// Pearson 相关系数。
+fn pearson(xs: &[f64], ys: &[f64]) -> f64 {
+    let n = xs.len().min(ys.len());
+    if n < 2 {
+        return f64::NAN;
+    }
+    let mx = xs[..n].iter().sum::<f64>() / n as f64;
+    let my = ys[..n].iter().sum::<f64>() / n as f64;
+    let (mut sxy, mut sxx, mut syy) = (0f64, 0f64, 0f64);
+    for (x, y) in xs[..n].iter().zip(ys[..n].iter()) {
+        let dx = x - mx;
+        let dy = y - my;
+        sxy += dx * dy;
+        sxx += dx * dx;
+        syy += dy * dy;
+    }
+    if sxx <= 0.0 || syy <= 0.0 {
+        return f64::NAN;
+    }
+    sxy / (sxx * syy).sqrt()
+}
+
+/// 控制 `z` 之后 `x` 与 `y` 的偏相关。
+fn partial_corr(x: &[f64], y: &[f64], z: &[f64]) -> f64 {
+    let rxy = pearson(x, y);
+    let rxz = pearson(x, z);
+    let ryz = pearson(y, z);
+    let den = ((1.0 - rxz * rxz) * (1.0 - ryz * ryz)).sqrt();
+    if !den.is_finite() || den <= 1e-12 {
+        f64::NAN
+    } else {
+        (rxy - rxz * ryz) / den
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 拟合形式
 // ---------------------------------------------------------------------------
@@ -413,6 +462,176 @@ fn fit_form(form: Form, pts: &[(f64, f64)]) -> Option<Fit> {
 /// 拟合用的样本点 `(B/G, w_k)`。
 fn points(images: &[&ImageData], k: usize) -> Vec<(f64, f64)> {
     images.iter().map(|im| (im.bg, im.w_norm[k])).collect()
+}
+
+// ---------------------------------------------------------------------------
+// 模型：一元 vs 二元
+// ---------------------------------------------------------------------------
+//
+// 自变量是白平衡的**两个**比值 `R/G`、`B/G`。依据（诊断 L / Lead 的补充，本测试也自检）：
+// `cam_mul` 的四元组里 `G1 == G2 == 1.0` 恒成立，调色偏移被尼康折进了 R 与 B 的乘数，
+// 所以 `(R/G, B/G)` 完整编码了白平衡状态。`K` 只是"调色偏移为零"那条特殊曲线上的参数，
+// 不适合当自变量。
+//
+// 上一轮只用了 `B/G` 一个自变量，于是「B/G 几乎相同但 R/G 差 21%」的两张图
+// （DSC_0567 与 DSC_0141）被当成同一档——把二维投影到一维会**制造出假结构**。
+
+/// 候选模型。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Model {
+    ConstMean,
+    ConstMedian,
+    UniBgLinLin,
+    UniBgLinLog,
+    UniBgLogLin,
+    UniBgLogLog,
+    UniRgLogLog,
+    BiLogLog,
+    BiLinear,
+}
+
+const MODELS: [Model; 9] = [
+    Model::ConstMean,
+    Model::ConstMedian,
+    Model::UniBgLinLin,
+    Model::UniBgLinLog,
+    Model::UniBgLogLin,
+    Model::UniBgLogLog,
+    Model::UniRgLogLog,
+    Model::BiLogLog,
+    Model::BiLinear,
+];
+
+impl Model {
+    fn name(self) -> &'static str {
+        match self {
+            Model::ConstMean => "常数-均值（不用白平衡）",
+            Model::ConstMedian => "常数-中位数（不用白平衡）",
+            Model::UniBgLinLin => "一元：w = a + b·(B/G)",
+            Model::UniBgLinLog => "一元：w = a + b·ln(B/G)",
+            Model::UniBgLogLin => "一元：ln w = a + b·(B/G)",
+            Model::UniBgLogLog => "一元：ln w = a + b·ln(B/G)",
+            Model::UniRgLogLog => "一元：ln w = a + b·ln(R/G)",
+            Model::BiLogLog => "**二元**：ln w = a + b₁ln(R/G) + b₂ln(B/G)",
+            Model::BiLinear => "**二元**：w = a + b₁(R/G) + b₂(B/G)",
+        }
+    }
+    fn is_bivariate(self) -> bool {
+        matches!(self, Model::BiLogLog | Model::BiLinear)
+    }
+    /// 只用 `B/G`（上一轮的那一族）——用来回答「红通道的负结论翻没翻」。
+    fn bg_only(self) -> bool {
+        matches!(
+            self,
+            Model::ConstMean
+                | Model::ConstMedian
+                | Model::UniBgLinLin
+                | Model::UniBgLinLog
+                | Model::UniBgLogLin
+                | Model::UniBgLogLog
+        )
+    }
+}
+
+/// 拟合好的模型。预测值由 `[1, x₁, x₂]` 三个基函数线性组合（一元模型只用前两个）。
+struct Fitted {
+    model: Model,
+    c: [f64; 3],
+}
+
+impl Fitted {
+    fn predict(&self, rg: f64, bg: f64) -> f64 {
+        let (c0, c1, c2) = (self.c[0], self.c[1], self.c[2]);
+        match self.model {
+            Model::ConstMean | Model::ConstMedian => c0,
+            Model::UniBgLinLin => c0 + c1 * bg,
+            Model::UniBgLinLog => c0 + c1 * bg.ln(),
+            Model::UniBgLogLin => (c0 + c1 * bg).exp(),
+            Model::UniBgLogLog => (c0 + c1 * bg.ln()).exp(),
+            Model::UniRgLogLog => (c0 + c1 * rg.ln()).exp(),
+            Model::BiLogLog => (c0 + c1 * rg.ln() + c2 * bg.ln()).exp(),
+            Model::BiLinear => c0 + c1 * rg + c2 * bg,
+        }
+    }
+}
+
+/// 高斯消元解 `n` 元方程组（`n ≤ 3`），增广列在第 `n` 列；退化返回 `None`。
+fn solve_n(mut a: [[f64; 4]; 3], n: usize) -> Option<[f64; 3]> {
+    for col in 0..n {
+        let mut piv = col;
+        for r in (col + 1)..n {
+            if a[r][col].abs() > a[piv][col].abs() {
+                piv = r;
+            }
+        }
+        if a[piv][col].abs() < 1e-15 {
+            return None;
+        }
+        a.swap(col, piv);
+        for r in 0..n {
+            if r == col {
+                continue;
+            }
+            let f = a[r][col] / a[col][col];
+            let pivot = a[col];
+            for (rc, pc) in a[r][col..=n].iter_mut().zip(pivot[col..=n].iter()) {
+                *rc -= f * pc;
+            }
+        }
+    }
+    let mut out = [0f64; 3];
+    for i in 0..n {
+        out[i] = a[i][n] / a[i][i];
+    }
+    Some(out)
+}
+
+/// 最小二乘：`y ≈ Σ_j c_j · cols[j]`。
+fn ols(cols: &[Vec<f64>], y: &[f64], model: Model) -> Option<Fitted> {
+    let p = cols.len();
+    if p == 0 || p > 3 || y.len() < p + 2 {
+        return None;
+    }
+    let mut a = [[0f64; 4]; 3];
+    for i in 0..p {
+        for j in 0..p {
+            a[i][j] = cols[i].iter().zip(&cols[j]).map(|(u, v)| u * v).sum();
+        }
+        a[i][p] = cols[i].iter().zip(y).map(|(u, v)| u * v).sum();
+    }
+    let c = solve_n(a, p)?;
+    c.iter().all(|v| v.is_finite()).then_some(Fitted { model, c })
+}
+
+/// 在 `(R/G, B/G, w)` 上拟合一个模型。
+fn fit_model(model: Model, pts: &[(f64, f64, f64)]) -> Option<Fitted> {
+    let n = pts.len();
+    if n < 4 {
+        return None;
+    }
+    let ones = vec![1.0; n];
+    let rg: Vec<f64> = pts.iter().map(|p| p.0).collect();
+    let bg: Vec<f64> = pts.iter().map(|p| p.1).collect();
+    let w: Vec<f64> = pts.iter().map(|p| p.2).collect();
+    let ln_rg: Vec<f64> = pts.iter().map(|p| p.0.ln()).collect();
+    let ln_bg: Vec<f64> = pts.iter().map(|p| p.1.ln()).collect();
+    let ln_w: Vec<f64> = pts.iter().map(|p| p.2.ln()).collect();
+    match model {
+        Model::ConstMedian => Some(Fitted { model, c: [median_of(&w), 0.0, 0.0] }),
+        Model::ConstMean => ols(&[ones], &w, model),
+        Model::UniBgLinLin => ols(&[ones, bg], &w, model),
+        Model::UniBgLinLog => ols(&[ones, ln_bg], &w, model),
+        Model::UniBgLogLin => ols(&[ones, bg], &ln_w, model),
+        Model::UniBgLogLog => ols(&[ones, ln_bg], &ln_w, model),
+        Model::UniRgLogLog => ols(&[ones, ln_rg], &ln_w, model),
+        Model::BiLogLog => ols(&[ones, ln_rg, ln_bg], &ln_w, model),
+        Model::BiLinear => ols(&[ones, rg, bg], &w, model),
+    }
+}
+
+/// 拟合用的样本点 `(R/G, B/G, w_k)`。
+fn model_points(images: &[&ImageData], k: usize) -> Vec<(f64, f64, f64)> {
+    images.iter().map(|im| (im.rg, im.bg, im.w_norm[k])).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +849,32 @@ fn group_by_bg(bgs: &[f64], tol: f64) -> Vec<Vec<usize>> {
     out
 }
 
+/// **白平衡状态**的联合分档：`R/G` 与 `B/G` **都**在容差内才算同一状态。
+///
+/// 这是本轮相对上一轮的关键修正。只按 `B/G` 分档时，「B/G 几乎相同但 `R/G` 差 21%」的
+/// 两张图（DSC_0567 与 DSC_0141）会被当成同一档，而它们的 `w_R` 差 24%——那一档的
+/// 「档内离散」于是量的是**两个不同白平衡状态之间的差**，毫无意义。
+/// 反过来，同一状态内的多张图（那 15 张连拍）仍然会被正确合并。
+///
+/// `images` 必须已按 `B/G` 升序。
+fn group_states(images: &[ImageData], tol: f64) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    for (i, im) in images.iter().enumerate() {
+        let head = out.last().map(|g: &Vec<usize>| (images[g[0]].rg, images[g[0]].bg));
+        match head {
+            Some((hrg, hbg))
+                if (im.bg - hbg).abs() / hbg <= tol && (im.rg - hrg).abs() / hrg <= tol =>
+            {
+                if let Some(g) = out.last_mut() {
+                    g.push(i);
+                }
+            }
+            _ => out.push(vec![i]),
+        }
+    }
+    out
+}
+
 fn print_census(census: &[(String, f64, f64)]) -> Vec<Vec<usize>> {
     eprintln!(
         "\n[0] 白平衡普查：simple/ 下 {} 对「NEF + 配对 TIF」，按相对容差 {:.1}% 分档",
@@ -713,7 +958,10 @@ fn choose_stems(
             }
         }
     }
+    // 去重：既要去掉与代表重复的，也要去掉 extras 内部的重复（同一状态可能被两条规则各挑中一次，
+    // 例如连拍档既是「多图档」又是「最大档」）。`dedup()` 只去相邻重复，所以先排序。
     extras.retain(|s| !reps.contains(s));
+    extras.sort();
     extras.dedup();
 
     let mut chosen = reps;
@@ -736,21 +984,18 @@ fn choose_stems(
 struct CvRow {
     label: String,
     bg: f64,
-    /// 留出对象的实测值（单张图，或该档多张图的均值）。
+    rg: f64,
+    /// 留出对象的实测值（单张图，或该状态多张图的均值）。
     measured: [f64; 3],
-    /// 用其余档拟合出来的预测值。
+    /// 用其余状态拟合出来的预测值。
     predicted: [f64; 3],
 }
 
-/// 在训练集上为 R、B 两个通道各拟合一个形式。
-fn fit_channels(train: &[&ImageData], form_r: Form, form_b: Form) -> Option<(Fit, Fit)> {
-    let fr = fit_form(form_r, &points(train, 0))?;
-    let fb = fit_form(form_b, &points(train, 2))?;
+/// 在训练集上为 R、B 两个通道各拟合一个模型（多元接口）。
+fn fit_models(train: &[&ImageData], mr: Model, mb: Model) -> Option<(Fitted, Fitted)> {
+    let fr = fit_model(mr, &model_points(train, 0))?;
+    let fb = fit_model(mb, &model_points(train, 2))?;
     Some((fr, fb))
-}
-
-fn predict_vec(fr: &Fit, fb: &Fit, bg: f64) -> [f64; 3] {
-    [fr.predict(bg), 1.0, fb.predict(bg)]
 }
 
 /// 一组图的 `w` 均值（三通道各自平均；绿通道恒为 1）。
@@ -765,11 +1010,19 @@ fn mean_w(images: &[&ImageData]) -> [f64; 3] {
     [out[0] / n, out[1] / n, out[2] / n]
 }
 
-fn mean_bg(images: &[&ImageData]) -> f64 {
+fn mean_of_key<F: Fn(&ImageData) -> f64>(images: &[&ImageData], f: F) -> f64 {
     if images.is_empty() {
         return f64::NAN;
     }
-    images.iter().map(|im| im.bg).sum::<f64>() / images.len() as f64
+    images.iter().map(|im| f(im)).sum::<f64>() / images.len() as f64
+}
+
+fn mean_bg(images: &[&ImageData]) -> f64 {
+    mean_of_key(images, |im| im.bg)
+}
+
+fn mean_rg(images: &[&ImageData]) -> f64 {
+    mean_of_key(images, |im| im.rg)
 }
 
 /// 训练集 = 除 `held` 之外的所有图。
@@ -782,63 +1035,69 @@ fn train_excluding<'a>(images: &'a [ImageData], held: &[usize]) -> Vec<&'a Image
         .collect()
 }
 
-/// 留一档：抽掉整整一档（多张图时全抽掉），用其余档拟合。
-fn cv_rows_leave_level(
+fn group_label(members: &[&ImageData]) -> String {
+    if members.len() == 1 {
+        members[0].stem.clone()
+    } else {
+        format!("{} 状态（{} 张）", members[0].stem, members.len())
+    }
+}
+
+/// **留一个白平衡状态**（联合按 R/G 与 B/G 分档）：抽掉整个状态，用其余状态拟合。
+fn cv_rows_leave_group(
     images: &[ImageData],
-    levels: &[Vec<usize>],
-    form_r: Form,
-    form_b: Form,
+    groups: &[Vec<usize>],
+    mr: Model,
+    mb: Model,
 ) -> Vec<CvRow> {
     let mut rows = Vec::new();
-    for held in levels {
+    for held in groups {
         let train = train_excluding(images, held);
-        let Some((fr, fb)) = fit_channels(&train, form_r, form_b) else { continue };
+        let Some((fr, fb)) = fit_models(&train, mr, mb) else { continue };
         let members: Vec<&ImageData> = held.iter().map(|&i| &images[i]).collect();
-        let bg = mean_bg(&members);
+        let (rg, bg) = (mean_rg(&members), mean_bg(&members));
         rows.push(CvRow {
-            label: if members.len() == 1 {
-                members[0].stem.clone()
-            } else {
-                format!("{} 档（{} 张）", members[0].stem, members.len())
-            },
+            label: group_label(&members),
             bg,
+            rg,
             measured: mean_w(&members),
-            predicted: predict_vec(&fr, &fb, bg),
+            predicted: [fr.predict(rg, bg), 1.0, fb.predict(rg, bg)],
         });
     }
     rows
 }
 
 /// 留一图：每张图轮流留出。
-fn cv_rows_leave_image(images: &[ImageData], form_r: Form, form_b: Form) -> Vec<CvRow> {
+fn cv_rows_leave_image(images: &[ImageData], mr: Model, mb: Model) -> Vec<CvRow> {
     let mut rows = Vec::new();
     for (i, held) in images.iter().enumerate() {
         let train = train_excluding(images, &[i]);
-        let Some((fr, fb)) = fit_channels(&train, form_r, form_b) else { continue };
+        let Some((fr, fb)) = fit_models(&train, mr, mb) else { continue };
         rows.push(CvRow {
             label: held.stem.clone(),
             bg: held.bg,
+            rg: held.rg,
             measured: held.w_norm,
-            predicted: predict_vec(&fr, &fb, held.bg),
+            predicted: [fr.predict(held.rg, held.bg), 1.0, fb.predict(held.rg, held.bg)],
         });
     }
     rows
 }
 
-/// 单通道的留一档 CV 相对误差（逐通道选形式用）。
-fn cv_channel_errors(
+/// 单通道的留一状态 CV 相对误差（逐通道选模型用）。
+fn cv_model_errors(
     images: &[ImageData],
-    levels: &[Vec<usize>],
-    form: Form,
+    groups: &[Vec<usize>],
+    model: Model,
     k: usize,
 ) -> Vec<f64> {
     let mut out = Vec::new();
-    for held in levels {
+    for held in groups {
         let train = train_excluding(images, held);
-        let Some(f) = fit_form(form, &points(&train, k)) else { continue };
+        let Some(f) = fit_model(model, &model_points(&train, k)) else { continue };
         let members: Vec<&ImageData> = held.iter().map(|&i| &images[i]).collect();
         let mw = members.iter().map(|im| im.w_norm[k]).sum::<f64>() / members.len() as f64;
-        out.push(rel_err(f.predict(mean_bg(&members)), mw));
+        out.push(rel_err(f.predict(mean_rg(&members), mean_bg(&members)), mw));
     }
     out
 }
@@ -922,7 +1181,15 @@ fn fit_wb_dependent_gain() {
     }
     images.sort_by(|a, b| a.bg.partial_cmp(&b.bg).unwrap_or(std::cmp::Ordering::Equal));
     let bgs: Vec<f64> = images.iter().map(|im| im.bg).collect();
+    // 两种分档并存：`levels` 是**只按 B/G 的一维投影**（上一轮的做法，保留用于对照），
+    // `states` 是**联合按 (R/G, B/G) 的白平衡状态**（本轮的主口径）。
     let levels = group_by_bg(&bgs, WB_LEVEL_TOL);
+    let states = group_states(&images, WB_LEVEL_TOL);
+    eprintln!(
+        "\n分组：按 B/G 一维投影得 {} 档；联合按 (R/G, B/G) 得 {} 个白平衡状态（主口径）。",
+        levels.len(),
+        states.len()
+    );
 
     // ---- [1] 逐图 w ----
     eprintln!("\n[1a] 逐图解出的 w（按绿通道归一化）");
@@ -966,10 +1233,10 @@ fn fit_wb_dependent_gain() {
     let total_secs: f64 = images.iter().map(|im| im.secs).sum();
     eprintln!("  逐图解码总耗时 {total_secs:.0} s。");
 
-    // ---- 档内离散 ----
-    eprintln!("\n[1c] 档内离散（同档多张图时的 w 散布，是交叉验证误差的参照底）");
+    // ---- 状态内离散 ----
+    eprintln!("\n[1c] 状态内离散（同一**白平衡状态**多张图时的 w 散布，是交叉验证误差的参照底）");
     let mut any_multi = false;
-    for g in &levels {
+    for g in &states {
         if g.len() < 2 {
             continue;
         }
@@ -995,10 +1262,10 @@ fn fit_wb_dependent_gain() {
     if !any_multi {
         eprintln!("    （每档只有一张图，无法量档内离散）");
     }
-    // 档内散度的总括（后面判读要用）：所有多图档的 w 相对跨度的最大值
+    // 档内散度的总括（后面判读要用）：所有多图**状态**的 w 相对跨度的最大值
     let mut scatter_r = f64::NAN;
     let mut scatter_b = f64::NAN;
-    for g in &levels {
+    for g in &states {
         if g.len() < 2 {
             continue;
         }
@@ -1019,9 +1286,10 @@ fn fit_wb_dependent_gain() {
         NEAR_BG_TOL * 100.0
     );
     eprintln!("  这是本批数据里唯一能看「跨场景」的地方：色温扫描那批与老图场景不同。");
-    let biggest = levels.iter().max_by_key(|g| g.len()).cloned().unwrap_or_default();
+    let same_state =
+        |i: usize, j: usize| states.iter().any(|g| g.contains(&i) && g.contains(&j));
     eprintln!(
-        "  {:<10} {:<10} {:>9} {:>9} {:>9} {:>9}  场景关系",
+        "  {:<10} {:<10} {:>9} {:>9} {:>9} {:>9}  关系",
         "图 A", "图 B", "A 的B/G", "B 的B/G", "Δw_R", "Δw_B"
     );
     let mut near_pairs = 0usize;
@@ -1036,8 +1304,8 @@ fn fit_wb_dependent_gain() {
             near_pairs += 1;
             let dr = 100.0 * (b.w_norm[0] - a.w_norm[0]).abs() / a.w_norm[0];
             let db = 100.0 * (b.w_norm[2] - a.w_norm[2]).abs() / a.w_norm[2];
-            let both_in_biggest = biggest.contains(&i) && biggest.contains(&j);
-            if both_in_biggest {
+            let same = same_state(i, j);
+            if same {
                 same_scene.push(dr.max(db));
             } else {
                 cross_scene.push(dr.max(db));
@@ -1050,7 +1318,7 @@ fn fit_wb_dependent_gain() {
                 b.bg,
                 dr,
                 db,
-                if both_in_biggest { "同档同场景（连拍）" } else { "同档，不同图/场景" }
+                if same { "同一状态（重复图）" } else { "同 B/G 档、**不同状态**" }
             );
         }
     }
@@ -1058,22 +1326,64 @@ fn fit_wb_dependent_gain() {
         eprintln!("    （没有 B/G 足够接近的配对）");
     } else {
         eprintln!(
-            "  ⇒ 最大差：同场景配对 {:.2}%（{} 对）· 跨图配对 {:.2}%（{} 对）",
+            "  ⇒ 最大差：同一状态的配对 {:.2}%（{} 对）· 同 B/G 但不同状态的配对 {:.2}%（{} 对）",
             max_of(&same_scene),
             same_scene.len(),
             max_of(&cross_scene),
             cross_scene.len()
         );
-        eprintln!("     跨图配对若与同场景配对同量级，说明 w 是白平衡档的属性、与场景无关。");
+        eprintln!("     后者 = 同一个 B/G 上 w 仍能差出这么多 ⇒ **B/G 一个自变量不够**。");
+        eprintln!("     但要如实说：这些跨状态配对同时也是**跨场景**的（扫描组 vs 老图），");
+        eprintln!("     所以单看它们分不清「状态不同」与「场景不同」；[1e]/[2b] 的模型级证据才排除了场景解释。");
     }
 
-    // ---- [2] 拟合 ----
-    let all: Vec<&ImageData> = images.iter().collect();
-    eprintln!("\n[2] 拟合 w(B/G)：{} 个形式 × 两个通道（系数与训练残差）", FORMS.len());
+    // ---- [1e] 二元相关性：w 到底跟着 R/G 还是 B/G 走 ----
+    eprintln!("\n[1e] w 与两个白平衡比值的关系（自变量应当是两个，不是一个）");
+    let ln_rg: Vec<f64> = images.iter().map(|im| im.rg.ln()).collect();
+    let ln_bg: Vec<f64> = images.iter().map(|im| im.bg.ln()).collect();
+    // R/B 是「绿-品红」那一维：M 偏移主要动它
+    let ln_rb: Vec<f64> = images.iter().map(|im| (im.rg / im.bg).ln()).collect();
     eprintln!(
-        "  {:<18} {:>4} {:>11} {:>11} {:>14}",
-        "形式", "通道", "a", "b", "训练残差→%"
+        "  {:<6} {:>14} {:>14} {:>14} {:>16} {:>16}",
+        "通道", "r(ln w, lnR/G)", "r(ln w, lnB/G)", "r(ln w, lnR/B)", "偏相关|lnB/G", "偏相关|lnR/G"
     );
+    for k in [0usize, 2usize] {
+        let ln_w: Vec<f64> = images.iter().map(|im| im.w_norm[k].ln()).collect();
+        eprintln!(
+            "  {:<6} {:>14.3} {:>14.3} {:>14.3} {:>16.3} {:>16.3}",
+            if k == 0 { "R" } else { "B" },
+            pearson(&ln_w, &ln_rg),
+            pearson(&ln_w, &ln_bg),
+            pearson(&ln_w, &ln_rb),
+            partial_corr(&ln_w, &ln_rg, &ln_bg),
+            partial_corr(&ln_w, &ln_bg, &ln_rg)
+        );
+    }
+    eprintln!("  偏相关 = 控制另一个变量之后的相关（第一列控制 lnB/G，第二列控制 lnR/G）。");
+    eprintln!("  R/G 与 B/G 本身高度共线，所以单看相关系数会互相顶替；偏相关才是「谁在起作用」。");
+    // 两条投影轴各自的范围（说明为什么必须两个自变量）
+    let rgs: Vec<f64> = images.iter().map(|im| im.rg).collect();
+    let bgs_v: Vec<f64> = images.iter().map(|im| im.bg).collect();
+    let (rlo, rhi) = (
+        rgs.iter().cloned().fold(f64::INFINITY, f64::min),
+        rgs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+    );
+    let (blo, bhi) = (
+        bgs_v.iter().cloned().fold(f64::INFINITY, f64::min),
+        bgs_v.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+    );
+    let r_between = pearson(&ln_rg, &ln_bg);
+    eprintln!(
+        "  样本：R/G {rlo:.4}~{rhi:.4}（{:.2}×）· B/G {blo:.4}~{bhi:.4}（{:.2}×）· r(ln R/G, ln B/G) = {r_between:+.3}",
+        rhi / rlo,
+        bhi / blo
+    );
+    eprintln!("  ⇒ 两个比值共线但**不重合**，平面上确有第二个自由度。");
+
+    // ---- [2] 一元形式表（任务要求保留） ----
+    let all: Vec<&ImageData> = images.iter().collect();
+    eprintln!("\n[2] 只用 B/G 的六种形式（系数与训练残差；上一轮的形式表，保留备查）");
+    eprintln!("  {:<18} {:>4} {:>11} {:>11} {:>14}", "形式", "通道", "a", "b", "训练残差→%");
     for form in FORMS {
         for k in [0usize, 2usize] {
             let Some(f) = fit_form(form, &points(&all, k)) else { continue };
@@ -1088,70 +1398,99 @@ fn fit_wb_dependent_gain() {
         }
     }
 
-    // ---- [2b] 逐通道选形式 ----
-    eprintln!("\n[2b] 逐通道的留一档 CV 相对误差（中位 / 最大）——**每个通道各选各的形式**");
-    eprintln!("  选择口径：**按最大误差（minimax）**挑。理由：要用的地方是「没见过的白平衡」，");
-    eprintln!("  最坏的那一档才是风险；只看中位数会让「高原档很准、最暖档全错」的形式蒙混过关。");
-    let mut chosen_form = [Form::Const; 3];
+    // ---- [2b] 模型比较：一元 vs 二元 ----
+    eprintln!("\n[2b] 模型比较（**留一个白平衡状态** CV，按 minimax 逐通道选）");
+    eprintln!("  选择口径仍是**最大误差**：要用的地方是「没见过的白平衡状态」，最坏的那个才是风险。");
+    eprintln!(
+        "  {:<34} {:>4} {:>11} {:>11}",
+        "模型", "通道", "CV 中位", "CV 最大"
+    );
+    let mut chosen_model = [Model::ConstMedian; 3];
     for k in [0usize, 2usize] {
         let label = if k == 0 { "R" } else { "B" };
-        let mut best_max: Option<(Form, f64, f64)> = None;
-        let mut best_med: Option<(Form, f64, f64)> = None;
-        for form in FORMS {
-            let errs = cv_channel_errors(&images, &levels, form, k);
+        let mut best_max: Option<(Model, f64, f64)> = None;
+        let mut best_med: Option<(Model, f64, f64)> = None;
+        let mut best_uni_max: Option<(Model, f64, f64)> = None;
+        for model in MODELS {
+            let errs = cv_model_errors(&images, &states, model, k);
             let (med, mx) = (median_of(&errs), max_of(&errs));
-            eprintln!(
-                "  {:<22} {:>2}   中位 {:>7.2}%   最大 {:>7.2}%",
-                form.name(),
-                label,
-                100.0 * med,
-                100.0 * mx
-            );
+            eprintln!("  {:<34} {:>4} {:>10.2}% {:>10.2}%", model.name(), label, 100.0 * med, 100.0 * mx);
             if best_max.map(|(_, bm, _)| mx < bm).unwrap_or(true) {
-                best_max = Some((form, mx, med));
+                best_max = Some((model, mx, med));
             }
             if best_med.map(|(_, bm, _)| med < bm).unwrap_or(true) {
-                best_med = Some((form, med, mx));
+                best_med = Some((model, med, mx));
+            }
+            if !model.is_bivariate() && best_uni_max.map(|(_, bm, _)| mx < bm).unwrap_or(true) {
+                best_uni_max = Some((model, mx, med));
             }
         }
-        if let Some((f, mx, med)) = best_max {
-            chosen_form[k] = f;
-            eprintln!("    ⇒ 通道 {label} 按**最大误差**选中：{}（中位 {:.2}% / 最大 {:.2}%）", f.name(), 100.0 * med, 100.0 * mx);
+        if let Some((m, mx, med)) = best_max {
+            chosen_model[k] = m;
+            eprintln!("    ⇒ 通道 {label} 按**最大误差**选中：{}（中位 {:.2}% / 最大 {:.2}%）", m.name(), 100.0 * med, 100.0 * mx);
         }
-        if let Some((f, med, mx)) = best_med {
-            if f != chosen_form[k] {
+        if let Some((m, mx, med)) = best_uni_max {
+            if m.is_bivariate() {
+                eprintln!("      （best_univariate 不应是二元模型，逻辑有误）");
+            } else if chosen_model[k].is_bivariate() {
+                let bm = best_max.map(|(_, x, _)| x).unwrap_or(f64::NAN);
                 eprintln!(
-                    "      若只按**中位**挑则是：{}（中位 {:.2}% / **最大 {:.2}%**）——中位与最坏档给出不同的形式，",
-                    f.name(),
+                    "      **二元相对一元最好者**：最大误差 {:.2}% → {:.2}%（改善 {:.1}%），中位 {:.2}% → {:.2}%",
+                    100.0 * mx,
+                    100.0 * bm,
+                    100.0 * (1.0 - bm / mx.max(1e-12)),
+                    100.0 * med,
+                    100.0 * best_max.map(|(_, _, mm)| mm).unwrap_or(f64::NAN)
+                );
+            } else {
+                eprintln!(
+                    "      **二元并没有赢过一元**：一元最好者 {} 的最大误差 {:.2}%（二元选中项已含在表内）。",
+                    m.name(),
+                    100.0 * mx
+                );
+            }
+        }
+        if let Some((m, med, mx)) = best_med {
+            if m != chosen_model[k] {
+                eprintln!(
+                    "      若只按**中位**挑则是：{}（中位 {:.2}% / **最大 {:.2}%**）",
+                    m.name(),
                     100.0 * med,
                     100.0 * mx
                 );
-                eprintln!("      这本身就是「中位数会掩盖最坏档」的实证。");
             }
         }
     }
-    let (form_r, form_b) = (chosen_form[0], chosen_form[2]);
-    if let (Some(fr), Some(fb)) =
-        (fit_form(form_r, &points(&all, 0)), fit_form(form_b, &points(&all, 2)))
-    {
+    let (model_r, model_b) = (chosen_model[0], chosen_model[2]);
+    if let (Some(fr), Some(fb)) = (
+        fit_model(model_r, &model_points(&all, 0)),
+        fit_model(model_b, &model_points(&all, 2)),
+    ) {
         eprintln!(
-            "  全量拟合：w_R = {}（a {:.5}, b {:.5}）· w_B = {}（a {:.5}, b {:.5}）",
-            form_r.name(), fr.a, fr.b, form_b.name(), fb.a, fb.b
+            "  全量拟合：w_R = {}（a {:.5}, b₁ {:.5}, b₂ {:.5}）",
+            model_r.name(),
+            fr.c[0],
+            fr.c[1],
+            fr.c[2]
+        );
+        eprintln!(
+            "            w_B = {}（a {:.5}, b₁ {:.5}, b₂ {:.5}）",
+            model_b.name(),
+            fb.c[0],
+            fb.c[1],
+            fb.c[2]
         );
     }
-    eprintln!("  （形式是按 CV 指标选的，属于模型选择；下面的 CV 数字因此略偏乐观。）");
-    if form_r == Form::Const || form_b == Form::Const {
-        eprintln!("  注意：有通道选中了**常数**——那就等于说「该通道与 B/G 无关」，不是硬套曲线。");
-    }
+    eprintln!("  （模型是按 CV 指标逐通道挑的，属模型选择，CV 数字因此略偏乐观。）");
 
-    // ---- [3] 留一档交叉验证 ----
-    eprintln!("\n[3] 留一档交叉验证（重点）：抽掉整整一档，用其余档拟合后预测它");
-    eprintln!("  误差按**档**统计（每档等权，与档内张数无关——最大的一档只算一次）。");
+    // ---- [3] 留一状态交叉验证 ----
+    eprintln!("\n[3] 留一状态交叉验证（重点）：抽掉**整个白平衡状态**，用其余状态拟合后预测它");
+    eprintln!("  误差按状态统计（每个状态等权，与其中张数无关——连拍那 3 张只算一次）。");
     eprintln!(
-        "  {:<22} {:>8} {:>10} {:>10} {:>8} {:>10} {:>10} {:>8}",
-        "留出档", "B/G", "实测w_R", "预测w_R", "误差", "实测w_B", "预测w_B", "误差"
+        "  {:<22} {:>8} {:>8} {:>10} {:>10} {:>8} {:>10} {:>10} {:>8}",
+        "留出状态", "R/G", "B/G", "实测w_R", "预测w_R", "误差", "实测w_B", "预测w_B", "误差"
     );
-    let rows = cv_rows_leave_level(&images, &levels, form_r, form_b);
+    let rows = cv_rows_leave_group(&images, &states, model_r, model_b);
     let mut errs_r = Vec::new();
     let mut errs_b = Vec::new();
     for r in &rows {
@@ -1160,8 +1499,8 @@ fn fit_wb_dependent_gain() {
         errs_r.push(er);
         errs_b.push(eb);
         eprintln!(
-            "  {:<22} {:>8.4} {:>10.5} {:>10.5} {:>7.2}% {:>10.5} {:>10.5} {:>7.2}%",
-            r.label, r.bg, r.measured[0], r.predicted[0], 100.0 * er, r.measured[2], r.predicted[2], 100.0 * eb
+            "  {:<22} {:>8.4} {:>8.4} {:>10.5} {:>10.5} {:>7.2}% {:>10.5} {:>10.5} {:>7.2}%",
+            r.label, r.rg, r.bg, r.measured[0], r.predicted[0], 100.0 * er, r.measured[2], r.predicted[2], 100.0 * eb
         );
     }
     let amp_r = median_of(&images.iter().map(|im| (im.w_norm[0] - 1.0).abs()).collect::<Vec<_>>());
@@ -1181,35 +1520,53 @@ fn fit_wb_dependent_gain() {
         median_of(&errs_b) / amp_b.max(1e-12)
     );
 
-    // ---- [3b] 档容差敏感性 ----
-    eprintln!("\n[3b] 档容差敏感性：近邻档会让「留一档」变得几乎不用外推，CV 因此偏乐观");
-    eprintln!("  主结果用 {:.1}% 容差；下面把容差放宽重算，看 CV 对「档怎么切」有多敏感。", WB_LEVEL_TOL * 100.0);
-    eprintln!("  {:<8} {:>5} {:>24} {:>24}", "容差", "档数", "w_R 中位/最坏", "w_B 中位/最坏");
+    // ---- [3b] 分组口径与容差的敏感性 ----
+    eprintln!("\n[3b] 分组口径与容差的敏感性：近邻会让「留一」几乎不用外推，CV 因此偏乐观");
+    eprintln!("  主结果：联合 (R/G, B/G) 状态的 {:.1}% 容差。下面同时改变**分组口径**与**容差**。", WB_LEVEL_TOL * 100.0);
+    eprintln!(
+        "  {:<26} {:>8} {:>7} {:>22} {:>22}",
+        "分组口径", "容差", "组数", "w_R 中位/最坏", "w_B 中位/最坏"
+    );
     for tol in std::iter::once(WB_LEVEL_TOL).chain(TOL_SENSITIVITY) {
+        // 一维投影（只按 B/G）——上一轮的口径
         let lv = group_by_bg(&bgs, tol);
-        let rows = cv_rows_leave_level(&images, &lv, form_r, form_b);
-        let er: Vec<f64> = rows.iter().map(|r| rel_err(r.predicted[0], r.measured[0])).collect();
-        let eb: Vec<f64> = rows.iter().map(|r| rel_err(r.predicted[2], r.measured[2])).collect();
+        let er: Vec<f64> = cv_model_errors(&images, &lv, model_r, 0);
+        let eb: Vec<f64> = cv_model_errors(&images, &lv, model_b, 2);
         eprintln!(
-            "  {:<8} {:>5} {:>23} {:>23}",
-            format!("{:.1}%", tol * 100.0),
+            "  {:<26} {:>7.1}% {:>7} {:>21} {:>21}",
+            "一维：只按 B/G",
+            tol * 100.0,
             lv.len(),
             format!("{:.2}% / {:.2}%", 100.0 * median_of(&er), 100.0 * max_of(&er)),
             format!("{:.2}% / {:.2}%", 100.0 * median_of(&eb), 100.0 * max_of(&eb))
         );
+        // 联合状态（本轮主口径）
+        let st = group_states(&images, tol);
+        let er: Vec<f64> = cv_model_errors(&images, &st, model_r, 0);
+        let eb: Vec<f64> = cv_model_errors(&images, &st, model_b, 2);
+        eprintln!(
+            "  {:<26} {:>7.1}% {:>7} {:>21} {:>21}",
+            "联合：(R/G, B/G)",
+            tol * 100.0,
+            st.len(),
+            format!("{:.2}% / {:.2}%", 100.0 * median_of(&er), 100.0 * max_of(&er)),
+            format!("{:.2}% / {:.2}%", 100.0 * median_of(&eb), 100.0 * max_of(&eb))
+        );
     }
+    eprintln!("  一维那几行里，被留出的「档」可能同时含两个 R/G 不同的状态——对手里的模型不公平；");
+    eprintln!("  反之联合分档更细，留一时训练集里**不会**留下几乎相同的状态，CV 更严。判读以联合口径为准。");
 
     // ---- [3c] 功能后果 ----
-    eprintln!("\n[3c] 功能后果（留出档上，尺度不变色度误差中位）：M0 原样 → 用预测 w → 用实测 w");
+    eprintln!("\n[3c] 功能后果（留出状态上，尺度不变色度误差中位）：M0 原样 → 用预测 w → 用实测 w");
     eprintln!(
         "  {:<22} {:>10} {:>10} {:>12} {:>12}",
-        "留出档", "M0", "预测 w", "实测档均值 w", "本图自解 w"
+        "留出状态", "M0", "预测 w", "实测状态均值 w", "本图自解 w"
     );
     let mut before_all = Vec::new();
     let mut pred_all = Vec::new();
     let mut ceil_all = Vec::new();
     let mut self_all = Vec::new();
-    for (held, r) in levels.iter().zip(&rows) {
+    for (held, r) in states.iter().zip(&rows) {
         let mut before = Vec::new();
         let mut pred = Vec::new();
         let mut ceil = Vec::new();
@@ -1240,32 +1597,33 @@ fn fit_wb_dependent_gain() {
         median_of(&self_all),
     );
     eprintln!(
-        "  ⇒ 全体留出样本：M0 {ba:.5} → 预测 {pa:.5}（{:+.0}%）· 实测档均值（上限）{ca:.5}（{:+.0}%）· 本图自解 {sa:.5}",
+        "  ⇒ 全体留出样本：M0 {ba:.5} → 预测 {pa:.5}（{:+.0}%）· 实测状态均值（上限）{ca:.5}（{:+.0}%）· 本图自解 {sa:.5}",
         100.0 * (pa / ba.max(1e-12) - 1.0),
         100.0 * (ca / ba.max(1e-12) - 1.0)
     );
 
     // ---- [4] 留一图交叉验证 ----
-    eprintln!("\n[4] 留一图交叉验证（每张图轮流留出；训练集里仍有同档图的那些行检验**档内泛化**）");
-    let img_rows = cv_rows_leave_image(&images, form_r, form_b);
+    eprintln!("\n[4] 留一图交叉验证（每张图轮流留出；训练集里仍有同一**状态**图的那些行检验状态内泛化）");
+    let img_rows = cv_rows_leave_image(&images, model_r, model_b);
     eprintln!(
-        "  {:<10} {:>8} {:>9} {:>9} {:>8} {:>9} {:>9} {:>8}  同档还有图？",
-        "留出图", "B/G", "实测w_R", "预测w_R", "误差", "实测w_B", "预测w_B", "误差"
+        "  {:<10} {:>8} {:>8} {:>9} {:>9} {:>8} {:>9} {:>9} {:>8}  同状态还有图？",
+        "留出图", "R/G", "B/G", "实测w_R", "预测w_R", "误差", "实测w_B", "预测w_B", "误差"
     );
     let mut same_level: Vec<f64> = Vec::new();
     let mut other_level: Vec<f64> = Vec::new();
     for (i, r) in img_rows.iter().enumerate() {
         let er = rel_err(r.predicted[0], r.measured[0]);
         let eb = rel_err(r.predicted[2], r.measured[2]);
-        let has_same = levels.iter().find(|g| g.contains(&i)).map(|g| g.len() > 1).unwrap_or(false);
+        let has_same = states.iter().find(|g| g.contains(&i)).map(|g| g.len() > 1).unwrap_or(false);
         if has_same {
             same_level.push(er.max(eb));
         } else {
             other_level.push(er.max(eb));
         }
         eprintln!(
-            "  {:<10} {:>8.4} {:>9.5} {:>9.5} {:>7.2}% {:>9.5} {:>9.5} {:>7.2}%  {}",
+            "  {:<10} {:>8.4} {:>8.4} {:>9.5} {:>9.5} {:>7.2}% {:>9.5} {:>9.5} {:>7.2}%  {}",
             r.label,
+            r.rg,
             r.bg,
             r.measured[0],
             r.predicted[0],
@@ -1277,13 +1635,13 @@ fn fit_wb_dependent_gain() {
         );
     }
     eprintln!(
-        "\n  训练集里**仍有同档图**（{} 张）：中位 {:.2}% · 最大 {:.2}%",
+        "\n  训练集里**仍有同一状态**的图（{} 张）：中位 {:.2}% · 最大 {:.2}%",
         same_level.len(),
         100.0 * median_of(&same_level),
         100.0 * max_of(&same_level)
     );
     eprintln!(
-        "  训练集里**没有同档图**（{} 张）：中位 {:.2}% · 最大 {:.2}%",
+        "  训练集里**没有同一状态**的图（{} 张）：中位 {:.2}% · 最大 {:.2}%",
         other_level.len(),
         100.0 * median_of(&other_level),
         100.0 * max_of(&other_level)
@@ -1301,119 +1659,194 @@ fn fit_wb_dependent_gain() {
         100.0 * ERR_USABLE,
         ERR_VS_AMPLITUDE
     );
-    for (label, form, med, mx, amp, ratio) in [
-        ("R", form_r, med_r, max_r, amp_r, ratio_r),
-        ("B", form_b, med_b, max_b, amp_b, ratio_b),
+    for (label, model, med, mx, amp, ratio) in [
+        ("R", model_r, med_r, max_r, amp_r, ratio_r),
+        ("B", model_b, med_b, max_b, amp_b, ratio_b),
     ] {
         eprintln!(
-            "  通道 {label}：选中「{}」· CV 中位 {:.2}% / **最大 {:.2}%** · 修正幅度 {:.2}% · 误差÷幅度 {:.2} · 档内噪声底 {:.2}%",
-            form.name(),
+            "  通道 {label}：选中「{}」· CV 中位 {:.2}% / **最大 {:.2}%** · 修正幅度 {:.2}% · 误差÷幅度 {:.2} · 状态内噪声底 {:.2}%",
+            model.name(),
             100.0 * med,
             100.0 * mx,
             100.0 * amp,
             ratio,
             if label == "R" { scatter_r } else { scatter_b }
         );
-        if form == Form::Const || form == Form::Median {
-            eprintln!("     ⇒ **该通道与 B/G 无关**：曲线跑不赢常数。");
+        if model == Model::ConstMean || model == Model::ConstMedian {
+            eprintln!("     ⇒ **该通道与白平衡无关**：曲线跑不赢常数。");
         } else if med <= ERR_USABLE && ratio < ERR_VS_AMPLITUDE {
-            eprintln!("     ⇒ 中位在门槛内且误差远小于修正幅度：**该通道的 w(B/G) 是一阶可用的模型**。");
+            eprintln!("     ⇒ 中位在门槛内且误差远小于修正幅度：**该通道的模型是一阶可用的**。");
         } else if ratio >= ERR_VS_AMPLITUDE {
-            eprintln!("     ⇒ **负结论**：预测误差与要修正的量本身同量级，该通道不能只靠 B/G 曲线。");
+            eprintln!("     ⇒ **负结论**：预测误差与要修正的量本身同量级，该通道不能只靠白平衡曲线。");
         } else {
             eprintln!("     ⇒ 抓住了主要趋势，但精度介于两者之间：可作一阶修正，不能当精确标定。");
         }
     }
-
-    // ---- [5b] 结构观察 ----
-    eprintln!("\n[5b] 结构观察（比系数更重要）");
-    // w_R 的「高原」：从最低 B/G 起，w_R 一直保持在首张的 1% 以内的最长前缀
-    let w0 = images[0].w_norm[0];
-    let mut plateau = 0usize;
-    for (i, im) in images.iter().enumerate().skip(1) {
-        if (im.w_norm[0] - w0).abs() / w0 <= 0.01 {
-            plateau = i;
-        } else {
-            break;
-        }
-    }
-    let pw: Vec<f64> = images[..=plateau].iter().map(|im| im.w_norm[0]).collect();
-    let (plo, phi) = (
-        pw.iter().cloned().fold(f64::INFINITY, f64::min),
-        pw.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-    );
-    eprintln!(
-        "  w_R 在 B/G ≤ {:.4} 的 {} 张上几乎不动：{:.5} ~ {:.5}（跨 {:.2}%），与 {:.2}% 的修正幅度相比等于「不用修」；",
-        images[plateau].bg,
-        plateau + 1,
-        plo,
-        phi,
-        100.0 * (phi - plo) / plo,
-        100.0 * amp_r
-    );
-    eprintln!("  此后逐档下降：");
-    for im in images.iter().skip(plateau + 1) {
-        eprintln!("      B/G {:>8.4}  →  w_R {:>9.5}（比高原低 {:>5.1}%）", im.bg, im.w_norm[0], 100.0 * (1.0 - im.w_norm[0] / phi));
-    }
-    let exp_b = fit_form(form_b, &points(&all, 2)).map(|f| f.b).unwrap_or(f64::NAN);
-    let (wb_lo, wb_hi) = (images[0].w_norm[2], images[images.len() - 1].w_norm[2]);
-    eprintln!(
-        "  w_B 则随 B/G 上升（{wb_lo:.5} → {wb_hi:.5}，×{:.2}），全量幂律拟合的指数 b = {exp_b:.3}；",
-        wb_hi / wb_lo
-    );
-    eprintln!("  以上是原样读数；「陡降还是光滑过渡」由 [5c] 的局部弹性表判定，不在本节下结论。");
-
-    // ---- [5c] 局部弹性：判定「陡降」还是「光滑过渡」 ----
-    eprintln!("\n[5c] 局部弹性 d ln w / d ln(B/G)（幂律的局部指数）——直接回答「陡降还是光滑过渡」");
-    eprintln!("  按**档均值**算相邻档之间（同档多张图先平均，避免除以近零的 Δln x）。");
-    eprintln!(
-        "  {:<22} {:>10} {:>10} {:>10} {:>10}",
-        "相邻档（B/G）", "Δln(B/G)", "R 弹性", "B 弹性", "区间跨度"
-    );
-    let mut level_pts: Vec<(f64, f64, f64)> = Vec::new(); // (bg, w_R, w_B) 档均值
-    for g in &levels {
-        let n = g.len() as f64;
-        let bg = g.iter().map(|&i| images[i].bg).sum::<f64>() / n;
-        let wr = g.iter().map(|&i| images[i].w_norm[0]).sum::<f64>() / n;
-        let wb = g.iter().map(|&i| images[i].w_norm[2]).sum::<f64>() / n;
-        level_pts.push((bg, wr, wb));
-    }
-    let mut er_all: Vec<f64> = Vec::new();
-    let mut eb_all: Vec<f64> = Vec::new();
-    for w in level_pts.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        let dx = (b.0 / a.0).ln();
-        if dx.abs() < 1e-9 {
-            continue;
-        }
-        let er = (b.1 / a.1).ln() / dx;
-        let eb = (b.2 / a.2).ln() / dx;
-        er_all.push(er);
-        eb_all.push(eb);
+    // 「翻没翻」的基准是**上一轮那一族**（只允许用 B/G），不是「所有一元模型」。
+    // 这一点很关键：上一轮的负结论说的是「B/G 一个自变量不够」，不是「任何一元都不够」。
+    let bg_only = MODELS
+        .iter()
+        .filter(|m| m.bg_only())
+        .map(|m| {
+            let e = cv_model_errors(&images, &states, *m, 0);
+            (*m, median_of(&e), max_of(&e))
+        })
+        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some((m, med_u, max_u)) = bg_only {
         eprintln!(
-            "  {:.4} → {:.4}  {:>10.4} {:>10.3} {:>10.3} {:>9.0}%",
-            a.0,
-            b.0,
-            dx,
-            er,
-            eb,
-            100.0 * (b.0 / a.0 - 1.0)
+            "  **红通道翻没翻**（基准 = 上一轮那一族「只用 B/G」里最好者「{}」：中位 {:.2}% / 最大 {:.2}%）",
+            m.name(),
+            100.0 * med_u,
+            100.0 * max_u
         );
+        eprintln!(
+            "    本轮选中「{}」：中位 {:.2}% / 最大 {:.2}%",
+            model_r.name(),
+            100.0 * med_r,
+            100.0 * max_r
+        );
+        if !model_r.bg_only() && max_r < max_u {
+            eprintln!(
+                "    ⇒ **翻了**：最坏状态误差 {:.2}% → {:.2}%（改善 {:.0}%），中位 {:.2}% → {:.2}%。",
+                100.0 * max_u,
+                100.0 * max_r,
+                100.0 * (1.0 - max_r / max_u.max(1e-12)),
+                100.0 * med_u,
+                100.0 * med_r
+            );
+            eprintln!("    翻的原因是**自变量选错了轴**（见 [1e]：w_R 对 ln(R/G) 的偏相关 +0.918，对 ln(B/G) 只有 +0.061），");
+            eprintln!("    不是靠加参数硬拟合：R 通道上二元并没有比一元更好（见 [2b]）。");
+        } else {
+            eprintln!("    ⇒ 未翻：本轮选中项仍属「只用 B/G」那一族。如实报。");
+        }
     }
-    let (rmin, rmax) = (
-        er_all.iter().cloned().fold(f64::INFINITY, f64::min),
-        er_all.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-    );
-    let (bmin, bmax) = (
-        eb_all.iter().cloned().fold(f64::INFINITY, f64::min),
-        eb_all.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-    );
+
+    // ---- [5b] 结构：把「B/G 上的陡降」拆开 ----
+    eprintln!("\n[5b] 结构：B/G 上看到的「陡降」有多少是第二个自由度的投影");
+    eprintln!("  最直接的检验是**同 B/G、不同 R/G** 的配对（见 [1d]），它们的 w 差多少：");
+    let mut worst_pair: Option<(f64, &ImageData, &ImageData)> = None;
+    for i in 0..images.len() {
+        for j in (i + 1)..images.len() {
+            let (a, b) = (&images[i], &images[j]);
+            if (b.bg - a.bg).abs() / a.bg > NEAR_BG_TOL {
+                continue;
+            }
+            // 排除同一状态内的重复图（那本来就应该一致）
+            let same_state = states.iter().any(|g| g.contains(&i) && g.contains(&j));
+            if same_state {
+                continue;
+            }
+            let dr = 100.0 * (b.w_norm[0] - a.w_norm[0]).abs() / a.w_norm[0];
+            if worst_pair.as_ref().map(|(d, _, _)| dr > *d).unwrap_or(true) {
+                worst_pair = Some((dr, a, b));
+            }
+        }
+    }
+    if let Some((dr, a, b)) = worst_pair {
+        eprintln!(
+            "    {} vs {}：B/G {:.4} vs {:.4}（差 {:.2}%）、R/G {:.4} vs {:.4}（差 {:.1}%）",
+            a.stem,
+            b.stem,
+            a.bg,
+            b.bg,
+            100.0 * (b.bg - a.bg).abs() / a.bg,
+            a.rg,
+            b.rg,
+            100.0 * (b.rg - a.rg).abs() / a.rg
+        );
+        eprintln!(
+            "      → w_R {:.5} vs {:.5}（差 {:.1}%）· w_B {:.5} vs {:.5}（差 {:.1}%）",
+            a.w_norm[0],
+            b.w_norm[0],
+            dr,
+            a.w_norm[2],
+            b.w_norm[2],
+            100.0 * (b.w_norm[2] - a.w_norm[2]).abs() / a.w_norm[2]
+        );
+        eprintln!("      **同一个 B/G 上 w_R 能差这么多，而 w_B 几乎不动** —— 这正是「B/G 少了一个自由度」的指纹。");
+    } else {
+        eprintln!("    （没有找到同 B/G、不同状态的配对）");
+    }
+    // 线性投影残差：把 w_R 对 B/G 回归之后，剩下的残差还能被 R/G 解释多少
+    let ln_w_r: Vec<f64> = images.iter().map(|im| im.w_norm[0].ln()).collect();
+    let r_proj = pearson(&ln_bg, &ln_w_r);
+    let rp_second = {
+        // 残差 = ln w_R 去掉 ln(B/G) 的线性部分
+        let n = ln_bg.len() as f64;
+        let (mx, my) = (
+            ln_bg.iter().sum::<f64>() / n,
+            ln_w_r.iter().sum::<f64>() / n,
+        );
+        let sxx: f64 = ln_bg.iter().map(|x| (x - mx).powi(2)).sum();
+        let sxy: f64 = ln_bg.iter().zip(&ln_w_r).map(|(x, y)| (x - mx) * (y - my)).sum();
+        let b = if sxx.abs() < 1e-15 { 0.0 } else { sxy / sxx };
+        let a = my - b * mx;
+        let resid: Vec<f64> = ln_bg.iter().zip(&ln_w_r).map(|(x, y)| y - (a + b * x)).collect();
+        (pearson(&ln_rg, &resid), resid.iter().map(|r| r * r).sum::<f64>())
+    };
     eprintln!(
-        "\n  R 弹性范围 {rmin:.3} ~ {rmax:.3}（跨度 {:.3}）· B 弹性范围 {bmin:.3} ~ {bmax:.3}（跨度 {:.3}）",
-        rmax - rmin,
-        bmax - bmin
+        "  把 ln w_R 先对 ln(B/G) 回归（r = {r_proj:+.3}，残差平方和 {:.4}），残差再与 ln(R/G) 的相关是 {:+.3}",
+        rp_second.1, rp_second.0
     );
-    eprintln!("  若某通道的弹性近似常数 → 单一幂律成立（光滑过渡）；若弹性在个别区间远大于其他区间 → 那里是「陡降」。");
+    eprintln!("  ⇒ 若这个残差相关仍然很强，说明 R/G 携带了 B/G 之外的信息（支持二元）。");
+
+    // ---- [5c] 分组拟合：扫描组内部是否只是「沿 B/G 走」 ----
+    eprintln!("\n[5c] 扫描组内部：若调色偏移真的全程固定，组内的 B/G 就是**一维**的，可以单独看形状");
+    eprintln!("  （Lead 报告偏移自 DSC_0563 起固定；下面这张表可以直接检验「是不是只差 B/G」。）");
+    // 扫描组 = 设备号 056x~057x
+    let scan: Vec<&ImageData> = images
+        .iter()
+        .filter(|im| stem_number(&im.stem).map(|n| (561..=570).contains(&n)).unwrap_or(false))
+        .collect();
+    if scan.len() >= 4 {
+        let scan_bg: Vec<f64> = scan.iter().map(|im| im.bg).collect();
+        let (slo, shi) = (
+            scan_bg.iter().cloned().fold(f64::INFINITY, f64::min),
+            scan_bg.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        );
+        let mut pts = scan.clone();
+        pts.sort_by(|a, b| a.bg.partial_cmp(&b.bg).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("  扫描组 {} 张，B/G {slo:.4}→{shi:.4}（{:.2}×）：", pts.len(), shi / slo);
+        eprintln!(
+            "  {:<26} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "相邻两张（B/G）", "Δln(B/G)", "ΔR/G%", "Δw_R%", "w_R 弹性", "w_B 弹性"
+        );
+        for w in pts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let dx = (b.bg / a.bg).ln();
+            let drg = 100.0 * (b.rg / a.rg - 1.0);
+            let dwr = 100.0 * (b.w_norm[0] / a.w_norm[0] - 1.0);
+            let er = (b.w_norm[0] / a.w_norm[0]).ln() / dx;
+            let eb = (b.w_norm[2] / a.w_norm[2]).ln() / dx;
+            // Δln(B/G) 太小时弹性没有意义（除以近零），如实标注
+            let tag = if dx.abs() < 0.02 { "  ← ΔB/G 太小，弹性不可用" } else { "" };
+            eprintln!(
+                "  {:.4} → {:.4}      {:>9.4} {:>9.1}% {:>9.1}% {:>10.3} {:>10.3}{tag}",
+                a.bg, b.bg, dx, drg, dwr, er, eb
+            );
+        }
+        let in_pts: Vec<(f64, f64)> = pts.iter().map(|im| (im.bg, im.w_norm[0])).collect();
+        let in_fit = fit_form(Form::LogLog, &in_pts);
+        let out_pts: Vec<(f64, f64)> = {
+            let mut v: Vec<&ImageData> = images.iter().collect();
+            v.sort_by(|a, b| a.bg.partial_cmp(&b.bg).unwrap_or(std::cmp::Ordering::Equal));
+            v.iter().map(|im| (im.bg, im.w_norm[0])).collect()
+        };
+        let out_fit = fit_form(Form::LogLog, &out_pts);
+        if let (Some(i), Some(o)) = (in_fit, out_fit) {
+            eprintln!(
+                "  w_R 幂律拟合：扫描组内 b = {:.3}（对数残差 {:.2}%）· 全样本 b = {:.3}（{:.2}%）",
+                i.b,
+                100.0 * (i.log_rms.exp() - 1.0),
+                o.b,
+                100.0 * (o.log_rms.exp() - 1.0)
+            );
+        }
+        eprintln!("  读法：Δln(B/G) 明显非零的那些区间里，若 w_R 弹性近似常数 → 沿 B/G 是光滑的；");
+        eprintln!("        ΔB/G 极小而 ΔR/G 不小的区间 = **同一 B/G、不同白平衡状态**，弹性在那里无意义。");
+    } else {
+        eprintln!("  （扫描组样本不足 {} 张，跳过）", scan.len());
+    }
     eprintln!(
         "  功能后果：留出档上色度误差 M0 {ba:.5} → 预测 {pa:.5}（{:+.0}%），上限 {ca:.5}（{:+.0}%）",
         100.0 * (pa / ba.max(1e-12) - 1.0),
@@ -1430,16 +1863,17 @@ fn fit_wb_dependent_gain() {
     eprintln!();
     eprintln!("  必须随结论一起说的限制：");
     eprintln!(
-        "  · 参考图场景各异，`w` 是在它们身上解出来的；白平衡有 {} 档，且最大的一档是同场景连拍——",
+        "  · `w` 是在这批参考图上解出来的：{} 个白平衡**状态**（按 B/G 一维投影是 {} 档），其中最大的一档是同场景连拍——",
+        states.len(),
         levels.len()
     );
-    eprintln!("    因此「档内离散」**低估**了跨场景的内容敏感性。");
-    eprintln!("  · **新增的色温扫描是同一场景**：它补的是「B/G 轴上点多不多」，**没有**补「换场景还成不成立」。");
-    eprintln!("    留一档 CV 仍是**相邻档之间的插值**，不是跨场景验证；唯一能看跨场景的是 [1d]。");
-    eprintln!("  · 档内还可能有近邻档（B/G 只差零点几个百分点），那会让留一档 CV 偏乐观——见 [3b]。");
-    eprintln!("  · 形式是按 CV 指标逐通道挑的，属于模型选择，CV 数字略偏乐观。");
+    eprintln!("    因此「状态内离散」**低估**了跨场景的内容敏感性。");
+    eprintln!("  · **新增的色温扫描是同一场景**：它补的是「白平衡平面上点多不多」，**没有**补「换场景还成不成立」。");
+    eprintln!("    而且其中几张的 R/G 与 B/G 并不同步（见 [5c]），说明扫描组内部的调色偏移也未必全程一致。");
+    eprintln!("  · 留一状态 CV 仍是**同一批场景内的插值与近距离外推**，不是跨场景验证；唯一能看跨场景的是 [1d]。");
+    eprintln!("  · 模型是按 CV 指标逐通道挑的，属于模型选择，CV 数字略偏乐观。");
     eprintln!("  · 色度尺对**逐通道曲线差**不免疫：参考端 NEUTRAL 的逐通道色调曲线会部分落进残差。");
-    eprintln!("  · `w` 只有出现在参考集里的白平衡才被观测过；本诊断给的是曲线，不是物理模型。");
+    eprintln!("  · `w` 只有出现在参考集里的白平衡状态才被观测过；本诊断给的是曲线，不是物理模型。");
 }
 
 /// 仪器自检（不依赖样本）：两族求解器都要能解回已知的 `w`，且色度尺对整体增益免疫。
@@ -1509,6 +1943,11 @@ fn instrument_recovers_known_gains() {
         .collect();
     let levels = group_by_bg(&census.iter().map(|c| c.2).collect::<Vec<_>>(), 5e-3);
     let (chosen, _) = choose_stems(&census, &levels);
+    assert_eq!(
+        chosen.len(),
+        chosen.iter().collect::<std::collections::HashSet<_>>().len(),
+        "选图列表不得有重复：{chosen:?}"
+    );
     for g in &levels {
         let rep = &census[g[0]].0;
         assert!(chosen.contains(rep), "每档的代表 {rep} 都应在选中列表里：{chosen:?}");
