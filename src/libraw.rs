@@ -430,6 +430,38 @@ pub fn read_dimensions(path: &Path) -> Result<(usize, usize)> {
     }
 }
 
+/// 读出**完整的四元**白平衡系数 `[R, G1, B, G2]`，不做去马赛克与色彩转换。
+///
+/// # 为什么要看 G1 与 G2
+///
+/// [`read_wb`] 只返回前三项，把 `G2` 丢掉了。但尼康的白平衡**微调**（A-B 与 G-M 两轴，
+/// 即 A2.0 / M2.25 这类偏移）在四元组里正是通过 **G1 与 G2 是否相等**体现的——
+/// 而这是 `B/G` 一个比值**捕获不到**的一维。
+///
+/// 实测证据（本项目）：`DSC_0141`（K 4830）与 `DSC_0567`（K 5550 且带调色偏移）
+/// 的 `B/G` 几乎相同（1.49609 vs 1.49414），而 `R/G` 差 21%（1.75000 vs 2.11133）。
+/// **同一 `B/G` 对应两种不同的白平衡**，所以拿 `B/G` 当唯一自变量必然出错。
+pub fn read_wb4(path: &Path) -> Result<[f32; 4]> {
+    if !path.is_file() {
+        return Err(Error::Io(format!("文件不存在：{}", path.display())));
+    }
+    let session = Session(unsafe { libraw_init(0) });
+    if session.0.is_null() {
+        return Err(Error::NoHandle);
+    }
+    let lr = session.0;
+    unsafe {
+        open_raw(lr, path)?;
+        check(libraw_unpack(lr))?;
+        Ok([
+            libraw_get_cam_mul(lr, 0),
+            libraw_get_cam_mul(lr, 1),
+            libraw_get_cam_mul(lr, 2),
+            libraw_get_cam_mul(lr, 3),
+        ])
+    }
+}
+
 /// 只读出白平衡系数，不做去马赛克与色彩转换。
 ///
 /// 用于快速扫描一批文件找出白平衡不同的样本——完整解码一张 45 MP 的 NEF 要十几秒，

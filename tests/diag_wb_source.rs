@@ -144,6 +144,17 @@ fn cam_mul_matches_nikons_own_wb_levels() {
         if let Ok(Some(k)) = makernote::color_temperature(&data) {
             eprintln!("       色温：{k} K");
         }
+        // 四元白平衡：G1 与 G2 是否相等，是调色偏移（A/M 微调）的直接读数
+        if let Ok(w4) = nikonrawview::libraw::read_wb4(&nef) {
+            let g_eq = (w4[1] - w4[3]).abs() < 1e-6;
+            let g_ratio = if w4[3].abs() > 1e-9 { (w4[1] / w4[3]) as f64 } else { f64::NAN };
+            eprintln!(
+                "       四元组 R={:.5} G1={:.5} B={:.5} G2={:.5}   G1/G2={g_ratio:.6}{}",
+                w4[0], w4[1], w4[2], w4[3],
+                if g_eq { "（相等）" } else { "  <-- 不等" }
+            );
+        }
+
 
 
         // 黑电平：LibRaw 的唯一来源就是 MakerNote tag 0x003d，用同一个解析器读它。
