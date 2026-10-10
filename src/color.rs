@@ -284,6 +284,7 @@ mod tests {
         Decoded {
             width: 1,
             height: 1,
+            rotated: false,
             pixels: vec![0; 3],
             wb: [1.0, 1.0, 1.0],
             rgb_cam: matrix,

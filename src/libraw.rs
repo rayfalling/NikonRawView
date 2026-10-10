@@ -233,9 +233,17 @@ impl Default for Options {
 /// 一次解码的结果。
 #[derive(Debug, Clone)]
 pub struct Decoded {
-    /// 输出像素的尺寸（等于 LibRaw 的 `iwidth` × `iheight`）。
+    /// 输出像素的尺寸。
+    ///
+    /// **注意不是** `iwidth × iheight`：解码层会按 EXIF 方向旋转输出，竖拍照片
+    /// 在这里是 `5520×8280` 而 `iwidth×iheight` 是 `8280×5520`。见 [`Self::rotated`]。
     pub width: usize,
     pub height: usize,
+    /// 输出是否相对**未旋转**的有效画幅被转过 90°。
+    ///
+    /// **裁切边距是针对未旋转画幅定义的**，因此调用方必须据此调整左右与上下，
+    /// 否则会切错边。
+    pub rotated: bool,
     /// 16 位线性 RGB，行主序，长度 = width × height × 3。
     pub pixels: Vec<u16>,
     /// 相机白平衡系数（R/G/B）。
@@ -368,9 +376,24 @@ fn decode_with_output(path: &Path, opts: &Options, output: OutputColor) -> Resul
         let raw_width = libraw_get_raw_width(lr).max(0) as usize;
         let raw_height = libraw_get_raw_height(lr).max(0) as usize;
 
+        // 输出尺寸应等于 iwidth×iheight，**或者是它的转置**。
+        //
+        // 解码层会按 EXIF 方向把输出旋转，而 `iwidth`/`iheight` 报的是未旋转的尺寸：
+        // 竖拍照片的输出是 5520×8280，而 iwidth×iheight 是 8280×5520。早前只接受
+        // 相等，于是**每一张竖拍都会失败**——而竖构图在实际拍摄中很常见。
+        //
+        // 两种都不满足才说明解码层行为有变，那时才值得暴露。
+        let same = iwidth == width && iheight == height;
+        let rotated = iwidth == height && iheight == width;
+        debug_assert!(
+            same || rotated,
+            "iwidth×iheight ({iwidth}×{iheight}) 与实际输出 ({width}×{height}) 既不相等也不互为转置"
+        );
+
         let d = Decoded {
             width,
             height,
+            rotated,
             pixels,
             wb,
             rgb_cam,
@@ -380,13 +403,6 @@ fn decode_with_output(path: &Path, opts: &Options, output: OutputColor) -> Resul
             raw_width,
             raw_height,
         };
-        // iwidth/iheight 应与实际像素尺寸一致；不一致说明解码层行为有变，值得暴露
-        debug_assert!(
-            iwidth == d.width && iheight == d.height,
-            "iwidth×iheight ({iwidth}×{iheight}) 与实际输出 ({}×{}) 不一致",
-            d.width,
-            d.height
-        );
         Ok(d)
     }
 }

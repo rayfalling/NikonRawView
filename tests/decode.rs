@@ -433,7 +433,84 @@ fn camera_matrix_varies_with_white_balance() {
     assert!(b.rgb_cam.iter().flatten().all(|v| v.is_finite()));
 }
 
-/// 5.1 的最终验收：对**真实的 15 对**参考导出（用户用 NX Studio 以「自然 + ADL 关闭」
+/// 5.4 第一步：把 NEF 与参考 TIF 都转到 ProPhoto 线性，看配对关系是不是一条
+/// **平滑单调**的曲线。
+///
+/// 这是拟合前的"看一眼"。若不是，说明样本里混进了非基准因素（某张被调整过、
+/// ADL 没关掉、配对错了），此时求解只会把问题一起拟合进去。
+#[test]
+fn reference_pairs_form_a_clean_curve() {
+    let dir = samples_dir();
+    let nef = dir.join("DSC_0001.NEF");
+    let tif = dir.join("DSC_0001.TIF");
+    if !nef.is_file() || !tif.is_file() {
+        eprintln!("跳过：缺少 DSC_0001 的 NEF 或 TIF");
+        return;
+    }
+
+    let tif_data = std::fs::read(&tif).unwrap();
+    let img = nikonrawview::fit::read_rgb16(&tif_data).expect("应能读参考 TIF");
+    eprintln!("参考 TIF：{}×{}，{} 个分量", img.width, img.height, img.pixels.len());
+
+    let plan = nikonrawview::icc::plan_for(&tif_data).expect("应能决定色彩空间方案");
+    eprintln!("色彩空间：{}", plan.describe());
+
+    let opts = Options { demosaic: Demosaic::Dht, user_mul: None };
+    let dec = libraw::decode_working_space(&nef, &opts).expect("应能解码 NEF");
+    eprintln!("解码：{}×{}（工作空间 ProPhoto 线性）", dec.width, dec.height);
+
+    let theirs = nikonrawview::fit::reference_to_working(&img, &plan);
+
+    // 参考导出是**有效区**，而解码是**传感器全幅**——先按边距裁切。
+    // 边距是针对未旋转画幅定义的，竖拍输出需要把左右与上下对调。
+    let model = nikonrawview::camera::read_model(&nef).expect("应能读出机型");
+    let entry = nikonrawview::camera::lookup(&model).expect("机型应在表中");
+    let mg = if dec.rotated { entry.margins.rotated() } else { entry.margins };
+    eprintln!("解码方向：{}", if dec.rotated { "竖拍（已旋转）" } else { "横拍" });
+    eprintln!("实际使用的边距：左{} 上{} 右{} 下{}", mg.left, mg.top, mg.right, mg.bottom);
+    let (cw, ch) = mg.effective(dec.width, dec.height).expect("应能裁出有效区");
+    eprintln!("裁切后 {cw}×{ch}，参考导出 {}×{}", img.width, img.height);
+    assert_eq!(
+        (cw, ch),
+        (img.width, img.height),
+        "按方向调整边距后，裁切尺寸应与参考导出一致"
+    );
+
+    let mut samples = Vec::new();
+    let stride = 37;
+    for y in (0..ch).step_by(stride) {
+        for x in (0..cw).step_by(stride) {
+            let sx = x + mg.left;
+            let sy = y + mg.top;
+            let j = x + y * img.width;
+            if j >= theirs.len() {
+                continue;
+            }
+            let Some(p) = dec.at(sx, sy) else { continue };
+            let o = [
+                p[0] as f32 / 65535.0,
+                p[1] as f32 / 65535.0,
+                p[2] as f32 / 65535.0,
+            ];
+            samples.push(nikonrawview::fit::Sample { ours: o, theirs: theirs[j] });
+        }
+    }
+    eprintln!("采集 {} 个配对样本", samples.len());
+
+    let d = nikonrawview::fit::diagnose(&samples, 10);
+    eprintln!("\n输入中位 → 输出中位（ProPhoto 线性）  样本数");
+    for (x, y, n) in &d.bins {
+        eprintln!("  {x:.2} → {y:.4}   {n}");
+    }
+    eprintln!("\n逆序次数 = {}（平滑单调应为 0）", d.inversions);
+    if let Some((lo, hi)) = d.slope_range {
+        eprintln!("相邻箱斜率范围 = {lo:.3} … {hi:.3}");
+    }
+    eprintln!("是否像干净的单调整曲线：{}", d.looks_clean());
+
+    assert!(samples.len() > 1000, "样本太少（{}）", samples.len());
+    assert!(d.looks_clean(), "配对关系不像一条干净的单调曲线，需先查样本");
+}
 /// 导出到 `simple/`）跑校验，全部应通过。
 #[test]
 fn the_manual_reference_exports_pass_validation() {

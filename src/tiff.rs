@@ -99,6 +99,14 @@ impl<'a> Tiff<'a> {
         self.base
     }
 
+    /// 底层字节。偏移量与 [`Entry`] 里给出的一样，是**绝对**偏移。
+    ///
+    /// 供需要自行批量读取的调用方使用（如按条带读 16 位像素）——那条路径上逐条目
+    /// 走 [`Self::bytes`] 会把每 2 字节都过一次边界检查。
+    pub fn raw(&self) -> &'a [u8] {
+        self.data
+    }
+
     /// IFD0 的绝对偏移。
     pub fn ifd0_offset(&self) -> Result<usize> {
         let p = self.base + 4;
