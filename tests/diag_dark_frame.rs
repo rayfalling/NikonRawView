@@ -28,12 +28,9 @@ mod common;
 
 use common::samples_dir;
 
-/// 统计一张平面图像的分布。
+/// 统计结果：均值与全零占比——判读只需要这两个。
 struct Stats {
-    n: usize,
     mean: f64,
-    p50: f64,
-    p99: f64,
     zero_frac: f64,
 }
 
@@ -59,7 +56,7 @@ fn stats(px: &[[f32; 3]], label: &str) -> Option<Stats> {
         lum[n - 1],
         100.0 * zeros as f64 / n as f64
     );
-    Some(Stats { n, mean, p50: q(0.5), p99: q(0.99), zero_frac: zeros as f64 / n as f64 })
+    Some(Stats { mean, zero_frac: zeros as f64 / n as f64 })
 }
 
 #[test]
