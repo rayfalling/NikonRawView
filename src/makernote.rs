@@ -168,9 +168,8 @@ pub fn black_level(data: &[u8]) -> Result<Option<BlackLevel>> {
     let black = raw.iter().copied().min().unwrap_or(0);
     // RGGB_2_RGBG(q) = q ^ (q >> 1)：文件序 [R,G1,B,G2] → 内部序 [R,G1,G2,B]
     let mut per_channel = [0u16; 4];
-    for c in 0..4usize {
-        let idx = c ^ (c >> 1);
-        per_channel[idx] = raw[c].saturating_sub(black);
+    for (c, v) in raw.iter().enumerate() {
+        per_channel[c ^ (c >> 1)] = v.saturating_sub(black);
     }
     Ok(Some(BlackLevel { raw, black, per_channel }))
 }
