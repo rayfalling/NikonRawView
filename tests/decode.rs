@@ -433,7 +433,93 @@ fn camera_matrix_varies_with_white_balance() {
     assert!(b.rgb_cam.iter().flatten().all(|v| v.is_finite()));
 }
 
-/// 5.4 第一步：把 NEF 与参考 TIF 都转到 ProPhoto 线性，看配对关系是不是一条
+/// 5.4 求解：由配对样本拟合「一维色调曲线 + 三维色彩查找表」，报告残差。
+#[test]
+fn fitted_transform_reproduces_the_reference() {
+    let dir = samples_dir();
+    let nef = dir.join("DSC_0001.NEF");
+    let tif = dir.join("DSC_0001.TIF");
+    if !nef.is_file() || !tif.is_file() {
+        eprintln!("跳过：缺少 DSC_0001 的 NEF 或 TIF");
+        return;
+    }
+
+    let tif_data = std::fs::read(&tif).unwrap();
+    let img = nikonrawview::fit::read_rgb16(&tif_data).unwrap();
+    let plan = nikonrawview::icc::plan_for(&tif_data).unwrap();
+    let opts = Options { demosaic: Demosaic::Dht, user_mul: None };
+    let dec = libraw::decode_working_space(&nef, &opts).unwrap();
+
+    let model = nikonrawview::camera::read_model(&nef).unwrap();
+    let entry = nikonrawview::camera::lookup(&model).unwrap();
+    let mg = if dec.rotated { entry.margins.rotated() } else { entry.margins };
+    let (cw, ch) = mg.effective(dec.width, dec.height).unwrap();
+    assert_eq!((cw, ch), (img.width, img.height));
+
+    let theirs = nikonrawview::fit::reference_to_working(&img, &plan);
+    let mut samples = Vec::new();
+    for y in (0..ch).step_by(11) {
+        for x in (0..cw).step_by(11) {
+            let j = x + y * img.width;
+            let Some(p) = dec.at(x + mg.left, y + mg.top) else { continue };
+            samples.push(nikonrawview::fit::Sample {
+                ours: [
+                    p[0] as f32 / 65535.0,
+                    p[1] as f32 / 65535.0,
+                    p[2] as f32 / 65535.0,
+                ],
+                theirs: theirs[j],
+            });
+        }
+    }
+    eprintln!("拟合样本 {} 个", samples.len());
+
+    let curve = nikonrawview::fit::fit_curve(&samples, 128);
+    eprintln!("曲线采样（每 16 点取一个）：");
+    for i in (0..curve.len()).step_by(16) {
+        eprintln!("  {:.3} → {:.4}", i as f32 / 128.0, curve[i]);
+    }
+    // 曲线必须单调不减
+    for w in curve.windows(2) {
+        assert!(w[1] >= w[0] - 1e-6, "曲线出现逆序：{} > {}", w[0], w[1]);
+    }
+
+    let edge = 17;
+    let lut = nikonrawview::fit::fit_lut(&samples, &curve, edge);
+    assert_eq!(lut.len(), edge * edge * edge * 3);
+
+    // 残差：曲线 + LUT 之后与参考的差
+    let mut sum = 0f64;
+    let mut worst = 0f64;
+    let mut n = 0u64;
+    let mut before = 0f64;
+    for s in &samples {
+        let c = [
+            nikonrawview::fit::apply_curve(&curve, s.ours[0]),
+            nikonrawview::fit::apply_curve(&curve, s.ours[1]),
+            nikonrawview::fit::apply_curve(&curve, s.ours[2]),
+        ];
+        let out = nikonrawview::fit::apply_lut(&lut, edge, c);
+        for k in 0..3 {
+            let e = (out[k] - s.theirs[k]).abs() as f64;
+            sum += e;
+            worst = worst.max(e);
+            before += (c[k] - s.theirs[k]).abs() as f64;
+            n += 1;
+        }
+    }
+    let mean = sum / n as f64;
+    let mean_curve_only = before / n as f64;
+    eprintln!("\n仅曲线：平均绝对差 {mean_curve_only:.6}");
+    eprintln!("曲线 + LUT：平均绝对差 {mean:.6}，最大 {worst:.6}（ProPhoto 线性，0..1）");
+
+    assert!(n > 10_000);
+    assert!(
+        mean < mean_curve_only,
+        "加上 LUT 后残差未下降（{mean:.6} vs {mean_curve_only:.6}）——LUT 没起作用"
+    );
+    assert!(mean < 0.02, "拟合残差 {mean:.6} 过大");
+}
 /// **平滑单调**的曲线。
 ///
 /// 这是拟合前的"看一眼"。若不是，说明样本里混进了非基准因素（某张被调整过、

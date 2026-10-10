@@ -257,7 +257,249 @@ impl CurveDiagnosis {
     }
 }
 
-/// 按亮度分箱，给出「输入 → 输出」的中位数映射。
+/// 拟合一维色调曲线。
+///
+/// # 做法与取舍
+///
+/// 按输入值分箱、取箱内输出值的**中位数**——中位数而非均值，是因为它能挡住少量
+/// 错配或极端像素。空箱用两侧邻居线性插值补上，最后**强制单调不减**。
+///
+/// 强制单调的理由：基准渲染本身是单调的，非单调的拟合结果只可能来自噪声。放它过去
+/// 会让画面出现局部反转的"色带"，而这种缺陷很难在缩略图上被发现。
+///
+/// 返回 `bins + 1` 个采样点，定义域与值域都是 0..1。
+pub fn fit_curve(samples: &[Sample], bins: usize) -> Vec<f32> {
+    let bins = bins.max(2);
+    let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); bins];
+    for s in samples {
+        for k in 0..3 {
+            let x = s.ours[k].clamp(0.0, 1.0);
+            let b = ((x * bins as f32) as usize).min(bins - 1);
+            buckets[b].push(s.theirs[k].clamp(0.0, 1.0));
+        }
+    }
+
+    // 各箱中位数；空箱记 None
+    let mut med: Vec<Option<f32>> = buckets
+        .iter_mut()
+        .map(|v| {
+            if v.is_empty() {
+                return None;
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            Some(v[v.len() / 2])
+        })
+        .collect();
+
+    // 空箱用两侧已知点线性插值；两端则用最近点外推
+    let known: Vec<usize> = (0..bins).filter(|i| med[*i].is_some()).collect();
+    if known.is_empty() {
+        // 没有任何样本——返回恒等，调用方应据此判断拟合无效
+        return (0..=bins).map(|i| i as f32 / bins as f32).collect();
+    }
+    for i in 0..bins {
+        if med[i].is_some() {
+            continue;
+        }
+        let lo = known.iter().rev().find(|k| **k < i).copied();
+        let hi = known.iter().find(|k| **k > i).copied();
+        med[i] = match (lo, hi) {
+            (Some(l), Some(h)) => {
+                let f = (i - l) as f32 / (h - l) as f32;
+                Some(med[l].unwrap() * (1.0 - f) + med[h].unwrap() * f)
+            }
+            (Some(l), None) => med[l],
+            (None, Some(h)) => med[h],
+            (None, None) => Some(i as f32 / bins as f32),
+        };
+    }
+
+    // 采样成 bins+1 个点，并强制单调不减
+    let mut out: Vec<f32> = (0..=bins)
+        .map(|i| {
+            if i == bins {
+                med[bins - 1].unwrap()
+            } else {
+                med[i].unwrap()
+            }
+        })
+        .collect();
+    for i in 1..out.len() {
+        if out[i] < out[i - 1] {
+            out[i] = out[i - 1];
+        }
+    }
+    out
+}
+
+/// 在采样点上对曲线求值（线性插值）。
+pub fn apply_curve(curve: &[f32], x: f32) -> f32 {
+    if curve.len() < 2 {
+        return x;
+    }
+    let x = x.clamp(0.0, 1.0);
+    let pos = x * (curve.len() - 1) as f32;
+    let i = pos.floor() as usize;
+    let j = (i + 1).min(curve.len() - 1);
+    let f = pos - i as f32;
+    curve[i] * (1.0 - f) + curve[j] * f
+}
+
+/// 拟合三维色彩查找表。
+///
+/// # 它在补什么
+///
+/// 一维曲线只处理**明暗**，补不了通道之间的差异。LUT 接收曲线之后的 RGB，输出参考
+/// 的 RGB——因此它承担的是色彩重映射那一半。
+///
+/// # 空网格怎么填
+///
+/// 画面分布不均，很多网格没有样本（尤其高光端）。空网格先由**邻域均值**迭代填充，
+/// 剩余仍为空的用最近的有效网格填充。这与"留 0"不同：留 0 会在那些区域产生**黑色
+/// 斑块**，而它们恰好落在人眼敏感的高光与暗部。
+///
+/// 返回 `edge³ × 3` 个值，行主序，R 变化最快。
+pub fn fit_lut(samples: &[Sample], curve: &[f32], edge: usize) -> Vec<f32> {
+    let edge = edge.max(2);
+    let n = edge * edge * edge;
+    let mut sum = vec![[0f64; 3]; n];
+    let mut cnt = vec![0u32; n];
+
+    let idx = |v: [f32; 3]| -> usize {
+        let q = |x: f32| ((x.clamp(0.0, 1.0) * (edge - 1) as f32).round() as usize).min(edge - 1);
+        (q(v[0]) * edge + q(v[1])) * edge + q(v[2])
+    };
+
+    for s in samples {
+        let c = [
+            apply_curve(curve, s.ours[0]),
+            apply_curve(curve, s.ours[1]),
+            apply_curve(curve, s.ours[2]),
+        ];
+        let i = idx(c);
+        for (k, t) in s.theirs.iter().enumerate() {
+            sum[i][k] += *t as f64;
+        }
+        cnt[i] += 1;
+    }
+
+    // 已知网格取均值
+    let mut lut = vec![[f32::NAN; 3]; n];
+    for i in 0..n {
+        if cnt[i] > 0 {
+            for k in 0..3 {
+                lut[i][k] = (sum[i][k] / cnt[i] as f64) as f32;
+            }
+        }
+    }
+
+    // 邻域迭代填充
+    for _ in 0..edge * 2 {
+        let mut filled = 0;
+        let mut next = lut.clone();
+        for x in 0..edge {
+            for y in 0..edge {
+                for z in 0..edge {
+                    let i = (x * edge + y) * edge + z;
+                    if !lut[i][0].is_nan() {
+                        continue;
+                    }
+                    let mut acc = [0f32; 3];
+                    let mut c = 0u32;
+                    for (dx, dy, dz) in [
+                        (-1i32, 0i32, 0i32),
+                        (1, 0, 0),
+                        (0, -1, 0),
+                        (0, 1, 0),
+                        (0, 0, -1),
+                        (0, 0, 1),
+                    ] {
+                        let (nx, ny, nz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                        if nx < 0 || ny < 0 || nz < 0 {
+                            continue;
+                        }
+                        let (nx, ny, nz) = (nx as usize, ny as usize, nz as usize);
+                        if nx >= edge || ny >= edge || nz >= edge {
+                            continue;
+                        }
+                        let j = (nx * edge + ny) * edge + nz;
+                        if lut[j][0].is_nan() {
+                            continue;
+                        }
+                        for k in 0..3 {
+                            acc[k] += lut[j][k];
+                        }
+                        c += 1;
+                    }
+                    if c > 0 {
+                        for k in 0..3 {
+                            next[i][k] = acc[k] / c as f32;
+                        }
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        lut = next;
+        if filled == 0 {
+            break;
+        }
+    }
+
+    // 仍有空的（极端情况）：取全体已知网格的均值
+    let mut avg = [0f32; 3];
+    let mut m = 0u32;
+    for v in lut.iter() {
+        if !v[0].is_nan() {
+            for k in 0..3 {
+                avg[k] += v[k];
+            }
+            m += 1;
+        }
+    }
+    let fallback = if m > 0 {
+        [avg[0] / m as f32, avg[1] / m as f32, avg[2] / m as f32]
+    } else {
+        [0.0, 0.0, 0.0]
+    };
+
+    let mut out = Vec::with_capacity(n * 3);
+    for v in lut {
+        for (k, x) in v.iter().enumerate() {
+            out.push(if x.is_nan() { fallback[k] } else { *x });
+        }
+    }
+    out
+}
+
+/// 在 LUT 上做三线性插值求值。
+pub fn apply_lut(lut: &[f32], edge: usize, v: [f32; 3]) -> [f32; 3] {
+    if edge < 2 || lut.len() < edge * edge * edge * 3 {
+        return v;
+    }
+    let f = |x: f32| -> (usize, usize, f32) {
+        let p = x.clamp(0.0, 1.0) * (edge - 1) as f32;
+        let i = (p.floor() as usize).min(edge - 2);
+        (i, i + 1, p - i as f32)
+    };
+    let (r0, r1, fr) = f(v[0]);
+    let (g0, g1, fg) = f(v[1]);
+    let (b0, b1, fb) = f(v[2]);
+    let at = |r: usize, g: usize, b: usize, k: usize| lut[((r * edge + g) * edge + b) * 3 + k];
+
+    let mut out = [0f32; 3];
+    for (k, slot) in out.iter_mut().enumerate() {
+        let c00 = at(r0, g0, b0, k) * (1.0 - fb) + at(r0, g0, b1, k) * fb;
+        let c01 = at(r0, g1, b0, k) * (1.0 - fb) + at(r0, g1, b1, k) * fb;
+        let c10 = at(r1, g0, b0, k) * (1.0 - fb) + at(r1, g0, b1, k) * fb;
+        let c11 = at(r1, g1, b0, k) * (1.0 - fb) + at(r1, g1, b1, k) * fb;
+        let c0 = c00 * (1.0 - fg) + c01 * fg;
+        let c1 = c10 * (1.0 - fg) + c11 * fg;
+        *slot = c0 * (1.0 - fr) + c1 * fr;
+    }
+    out
+}
+
 ///
 /// 这是拟合前的"看一眼"：若曲线有逆序或斜率剧烈跳变，说明样本里混进了非基准因素，
 /// 此时求解只会把问题拟合进去。
