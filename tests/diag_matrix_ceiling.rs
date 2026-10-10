@@ -24,15 +24,21 @@
 
 mod common;
 
-use common::{fitted_fixture_for, quantiles, samples_dir};
+use common::{quantiles, samples_dir};
 use nikonrawview::deltae;
 use nikonrawview::libraw::{self, Demosaic, Options, OutputColor};
 use nikonrawview::mat3;
 
+/// 一行配对：相机空间值、参考的 ProPhoto 线性值、裁剪后坐标。
+type Row = ([f32; 3], [f32; 3], (usize, usize));
+
+/// 评估结果：中位数、P95、最大值、以及逐样本的 (变换后, 参考) 配对。
+type EvalResult = (f64, f64, f64, Vec<([f32; 3], [f32; 3])>);
+
 /// 一张图的相机空间 / 参考配对（含裁剪与朝向处理）。
 struct ImagePairs {
     /// `(相机空间值, 参考的 ProPhoto 线性值, 裁剪后坐标)`
-    rows: Vec<([f32; 3], [f32; 3], (usize, usize))>,
+    rows: Vec<Row>,
 }
 
 fn collect(stem: &str) -> Option<ImagePairs> {
@@ -86,7 +92,7 @@ fn collect(stem: &str) -> Option<ImagePairs> {
 }
 
 /// 用给定的前端把 `[(相机值, 参考值)]` 拟合并评估一遍，返回 ΔE00 分位数。
-fn fit_and_eval(pairs: &[([f32; 3], [f32; 3])]) -> (f64, f64, f64, Vec<([f32; 3], [f32; 3])>) {
+fn fit_and_eval(pairs: &[([f32; 3], [f32; 3])]) -> EvalResult {
     let samples: Vec<nikonrawview::fit::Sample> = pairs
         .iter()
         .map(|(c, t)| nikonrawview::fit::Sample { ours: *c, theirs: *t })
@@ -145,7 +151,10 @@ fn how_far_can_a_corrected_matrix_get_us() {
     }
 
     eprintln!("\n--- 三方案对照（自适应后端：曲线 128 箱 + LUT 17³，各自重新拟合）---");
-    eprintln!("  {:<10} {:<12} {:>8} {:>8} {:>9}   {}", "图", "方案", "中位", "P95", "最大", "明度/彩度/色相 占比");
+    eprintln!(
+        "  {:<10} {:<12} {:>8} {:>8} {:>9}   明度/彩度/色相 占比",
+        "图", "方案", "中位", "P95", "最大"
+    );
     for (stem, p) in &all {
         // 方案一：现状——用 LibRaw 的 ProPhoto 输出（等价于我们的固定矩阵）
         let cur: Vec<([f32; 3], [f32; 3])> = p.rows.iter().map(|r| (r.0, r.1)).collect();
