@@ -15,6 +15,7 @@
 pub mod calibrate;
 pub mod camera;
 pub mod color;
+pub mod deltae;
 pub mod error;
 pub mod fit;
 pub mod icc;

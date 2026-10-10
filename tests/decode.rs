@@ -433,6 +433,95 @@ fn camera_matrix_varies_with_white_balance() {
     assert!(b.rgb_cam.iter().flatten().all(|v| v.is_finite()));
 }
 
+/// 5.5 质量报告：ΔE00 的中位数、P95 与误差最大的若干样本。
+///
+/// 目标为中位数 ≤ 1.0、P95 ≤ 3.0（JND 约 2.3）。**未达标时必须明确报出未达标**，
+/// 不能静默接受——一个看起来达标但实际不达标的报告比没有报告更糟。
+///
+/// 拟合与评估**用不同的像素子集**：即便 5.6 尚未做正式划分，也不该拿"背下来的
+/// 答案"来评估自己。
+#[test]
+fn delta_e00_quality_report() {
+    let dir = samples_dir();
+    let nef = dir.join("DSC_0001.NEF");
+    let tif = dir.join("DSC_0001.TIF");
+    if !nef.is_file() || !tif.is_file() {
+        eprintln!("跳过：缺少 DSC_0001");
+        return;
+    }
+
+    let tif_data = std::fs::read(&tif).unwrap();
+    let img = nikonrawview::fit::read_rgb16(&tif_data).unwrap();
+    let plan = nikonrawview::icc::plan_for(&tif_data).unwrap();
+    let opts = Options { demosaic: Demosaic::Dht, user_mul: None };
+    let dec = libraw::decode_working_space(&nef, &opts).unwrap();
+    let model = nikonrawview::camera::read_model(&nef).unwrap();
+    let entry = nikonrawview::camera::lookup(&model).unwrap();
+    let mg = if dec.rotated { entry.margins.rotated() } else { entry.margins };
+    let (cw, ch) = mg.effective(dec.width, dec.height).unwrap();
+    let theirs = nikonrawview::fit::reference_to_working(&img, &plan);
+
+    let mut fit_samples = Vec::new();
+    let mut eval_pairs = Vec::new();
+    let mut k = 0usize;
+    for y in (0..ch).step_by(13) {
+        for x in (0..cw).step_by(13) {
+            let j = x + y * img.width;
+            let Some(p) = dec.at(x + mg.left, y + mg.top) else { continue };
+            let ours = [
+                p[0] as f32 / 65535.0,
+                p[1] as f32 / 65535.0,
+                p[2] as f32 / 65535.0,
+            ];
+            k += 1;
+            if k % 2 == 0 {
+                fit_samples.push(nikonrawview::fit::Sample { ours, theirs: theirs[j] });
+            } else {
+                eval_pairs.push((ours, theirs[j]));
+            }
+        }
+    }
+    eprintln!("拟合样本 {} 个，评估样本 {} 个（已分离）", fit_samples.len(), eval_pairs.len());
+    assert!(fit_samples.len() > 1000 && eval_pairs.len() > 1000);
+
+    let curve = nikonrawview::fit::fit_curve(&fit_samples, 128);
+    let edge = 17;
+    let lut = nikonrawview::fit::fit_lut(&fit_samples, &curve, edge);
+    let t = nikonrawview::transform::BaseTransform::from_fit(
+        0x0000,
+        "NEUTRAL",
+        vec!["simple/DSC_0001".into()],
+        curve,
+        edge,
+        lut,
+    );
+
+    let evaluated: Vec<([f32; 3], [f32; 3])> =
+        eval_pairs.iter().map(|(o, r)| (t.apply(*o), *r)).collect();
+    let rep = nikonrawview::deltae::report(&evaluated, 5);
+
+    eprintln!("\n=== ΔE00 质量报告（留出评估集，{} 个样本）===", rep.count);
+    eprintln!("  中位数 = {:.3}   （目标 ≤ {:.1}）", rep.median, rep.median_target);
+    eprintln!("  P95    = {:.3}   （目标 ≤ {:.1}）", rep.p95, rep.p95_target);
+    eprintln!("  最大   = {:.3}", rep.max);
+    eprintln!("  判定：{}", rep.verdict());
+    eprintln!("\n误差最大的 5 个样本（ΔE00，我们的线性值 → 参考的线性值）：");
+    for (i, de, ours, refv) in &rep.worst {
+        eprintln!(
+            "  #{i}  ΔE00={de:.2}   [{:.3} {:.3} {:.3}] → [{:.3} {:.3} {:.3}]",
+            ours[0], ours[1], ours[2], refv[0], refv[1], refv[2]
+        );
+    }
+
+    assert!(rep.median.is_finite() && rep.p95.is_finite());
+    assert_eq!(rep.worst.len(), 5);
+    if !rep.meets_target() {
+        eprintln!("\n**未达标** —— 按设计不静默接受，结论如上。");
+        eprintln!("可能原因：高光端样本极少（每箱 1–7 个），曲线在输入 0.75 以上压平。");
+        eprintln!("应先补高光参考样张，而不是调松目标。");
+    }
+}
+
 /// 5.4 收尾：拟合 → 落成数据文件 → 读回 → **残差逐点复现**。
 ///
 /// 只验证"写出去能读回来"是不够的——那只证明序列化没丢字节。真正要验证的是
