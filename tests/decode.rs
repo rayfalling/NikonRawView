@@ -433,7 +433,103 @@ fn camera_matrix_varies_with_white_balance() {
     assert!(b.rgb_cam.iter().flatten().all(|v| v.is_finite()));
 }
 
-/// 5.4 求解：由配对样本拟合「一维色调曲线 + 三维色彩查找表」，报告残差。
+/// 5.4 收尾：拟合 → 落成数据文件 → 读回 → **残差逐点复现**。
+///
+/// 只验证"写出去能读回来"是不够的——那只证明序列化没丢字节。真正要验证的是
+/// **读回来的变换与拟合时的变换在数值上等价**，否则日常渲染拿到的就不是被评估过
+/// 的那份东西。
+#[test]
+fn fitted_transform_survives_the_file_roundtrip() {
+    let dir = samples_dir();
+    let nef = dir.join("DSC_0001.NEF");
+    let tif = dir.join("DSC_0001.TIF");
+    if !nef.is_file() || !tif.is_file() {
+        eprintln!("跳过：缺少 DSC_0001");
+        return;
+    }
+
+    let tif_data = std::fs::read(&tif).unwrap();
+    let img = nikonrawview::fit::read_rgb16(&tif_data).unwrap();
+    let plan = nikonrawview::icc::plan_for(&tif_data).unwrap();
+    let opts = Options { demosaic: Demosaic::Dht, user_mul: None };
+    let dec = libraw::decode_working_space(&nef, &opts).unwrap();
+    let model = nikonrawview::camera::read_model(&nef).unwrap();
+    let entry = nikonrawview::camera::lookup(&model).unwrap();
+    let mg = if dec.rotated { entry.margins.rotated() } else { entry.margins };
+    let (cw, ch) = mg.effective(dec.width, dec.height).unwrap();
+
+    let theirs = nikonrawview::fit::reference_to_working(&img, &plan);
+    let mut samples = Vec::new();
+    for y in (0..ch).step_by(11) {
+        for x in (0..cw).step_by(11) {
+            let j = x + y * img.width;
+            let Some(p) = dec.at(x + mg.left, y + mg.top) else { continue };
+            samples.push(nikonrawview::fit::Sample {
+                ours: [
+                    p[0] as f32 / 65535.0,
+                    p[1] as f32 / 65535.0,
+                    p[2] as f32 / 65535.0,
+                ],
+                theirs: theirs[j],
+            });
+        }
+    }
+
+    let curve = nikonrawview::fit::fit_curve(&samples, 128);
+    let edge = 17;
+    let lut = nikonrawview::fit::fit_lut(&samples, &curve, edge);
+
+    let t = nikonrawview::transform::BaseTransform::from_fit(
+        0x0000,
+        "NEUTRAL",
+        vec!["simple/DSC_0001.NEF + simple/DSC_0001.TIF".into()],
+        curve.clone(),
+        edge,
+        lut.clone(),
+    );
+
+    // 落盘 → 读回
+    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let p = out_dir.join("neutral-base.nbt");
+    nikonrawview::transform::write(&p, &t).expect("应能写出");
+    eprintln!("写出 {} 字节 → {}", std::fs::metadata(&p).unwrap().len(), p.display());
+
+    let back = nikonrawview::transform::read(&p).expect("应能读回");
+    assert_eq!(back, t, "读回的基准变换应与写出前逐字段一致");
+
+    // 关键：读回来的那份，施加结果必须与拟合时的施加逐点相同
+    let mut worst = 0f32;
+    let mut n = 0u64;
+    for s in &samples {
+        let a = t.apply(s.ours);
+        let b = back.apply(s.ours);
+        for k in 0..3 {
+            worst = worst.max((a[k] - b[k]).abs());
+            n += 1;
+        }
+    }
+    eprintln!("往返后施加结果的最大差异 = {worst:.9}（{n} 个分量）");
+    assert!(worst < 1e-6, "读回后的变换与原始不一致，最大差 {worst}");
+
+    // 顺带确认这份变换对同图仍有原来的解释力
+    let mut sum = 0f64;
+    let mut m = 0u64;
+    for s in &samples {
+        let o = back.apply(s.ours);
+        for (k, x) in o.iter().enumerate() {
+            sum += (*x - s.theirs[k]).abs() as f64;
+            m += 1;
+        }
+    }
+    eprintln!("读回后的变换在同图上的平均绝对差 = {:.6}", sum / m as f64);
+
+    // 元数据没丢：来源清单与名称都还在
+    assert_eq!(back.name, "NEUTRAL");
+    assert_eq!(back.sources.len(), 1);
+    assert!(back.sources[0].contains("DSC_0001"));
+    assert!(!back.is_identity(), "拟合出的变换不应是恒等");
+}
 #[test]
 fn fitted_transform_reproduces_the_reference() {
     let dir = samples_dir();

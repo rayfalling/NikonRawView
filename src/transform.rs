@@ -65,6 +65,39 @@ impl BaseTransform {
         }
     }
 
+    /// 由拟合结果构造（见 [`crate::fit`]）。
+    pub fn from_fit(
+        base_code: u16,
+        name: impl Into<String>,
+        sources: Vec<String>,
+        curve: Vec<f32>,
+        lut_edge: usize,
+        lut: Vec<f32>,
+    ) -> Self {
+        Self { base_code, name: name.into(), sources, curve, lut_edge, lut }
+    }
+
+    /// 施加到**工作空间的线性值**上：先曲线，后 LUT。
+    ///
+    /// 顺序不是随便定的——曲线负责明暗、LUT 是在曲线之后拟合出来的，它接收的正是
+    /// 曲线之后的 RGB。反过来施加会让 LUT 落在它没被拟合过的定义域上。
+    pub fn apply(&self, v: [f32; 3]) -> [f32; 3] {
+        let c = if self.curve.len() < 2 {
+            v
+        } else {
+            [
+                crate::fit::apply_curve(&self.curve, v[0]),
+                crate::fit::apply_curve(&self.curve, v[1]),
+                crate::fit::apply_curve(&self.curve, v[2]),
+            ]
+        };
+        if self.lut_edge < 2 || self.lut.is_empty() {
+            c
+        } else {
+            crate::fit::apply_lut(&self.lut, self.lut_edge, c)
+        }
+    }
+
     /// 是否为恒等变换（没有曲线也没有 LUT）。
     pub fn is_identity(&self) -> bool {
         self.curve.is_empty() && self.lut.is_empty()
