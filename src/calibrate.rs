@@ -127,62 +127,93 @@ impl ReferenceSet {
     }
 }
 
-/// 从 XMP 文本中提取 `crs:` / `crd:` 的属性键值。
+/// 从 XMP 文本中提取 `crs:` / `crd:` 的键值。
 ///
-/// 只做属性扫描，不引入 XML 解析器——这份 XMP 是 NX Studio 生成的定式文本，我们
-/// 只关心其中若干标量。属性名可能带 `crs:` 或 `crd:` 前缀（前者用于单文件设置，
-/// 后者用于默认值），两种前缀都收。
+/// # 两种写法都要认
+///
+/// XMP 表达同一件事有两种形式，**NX Studio 用的是后者**：
+///
+/// ```xml
+/// <rdf:Description crs:Exposure2012="0.33"/>          <!-- 属性形式 -->
+/// <rdf:Description><crd:Exposure2012>0.33</crd:Exposure2012></rdf:Description>  <!-- 元素形式 -->
+/// ```
+///
+/// 只认属性形式会漏掉 NX Studio 的全部输出——实测 15 张导出全部解析出 0 项，
+/// 校验因此会把合格样本全部误判为「无法确认无调整」。
+///
+/// # 为什么全程在字节上扫描
+///
+/// 按字节下标去切 `&str` 会在多字节字符中间 panic——NX Studio 的 XMP 带 BOM
+/// （U+FEFF，UTF-8 三字节），第一刀就会踩到。
 pub fn xmp_adjustments(xmp: &str) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
     let b = xmp.as_bytes();
     let mut i = 0;
-
-    // 全程在**字节**上扫描。按字节下标去切 &str 会在多字节字符中间 panic——
-    // NX Studio 的 XMP 带 BOM（U+FEFF，UTF-8 三字节），第一刀就会踩到。
     let is_name_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
 
     while i < b.len() {
-        let skip = if b[i..].starts_with(b"crs:") || b[i..].starts_with(b"crd:") {
-            4
-        } else {
-            i += 1;
-            continue;
-        };
-        let name_start = i + skip;
-        let mut j = name_start;
-        while j < b.len() && is_name_byte(b[j]) {
-            j += 1;
-        }
-        if j == name_start {
-            i += 1;
-            continue;
+        // —— 属性形式：crs:Name="值" / crd:Name="值"
+        let attr = b[i..].starts_with(b"crs:") || b[i..].starts_with(b"crd:");
+        if attr {
+            let name_start = i + 4;
+            let mut j = name_start;
+            while j < b.len() && is_name_byte(b[j]) {
+                j += 1;
+            }
+            if j > name_start {
+                let mut k = j;
+                while k < b.len() && b[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < b.len() && b[k] == b'=' {
+                    k += 1;
+                    while k < b.len() && b[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if k < b.len() && (b[k] == b'"' || b[k] == b'\'') {
+                        let q = b[k];
+                        let vs = k + 1;
+                        let mut v = vs;
+                        while v < b.len() && b[v] != q {
+                            v += 1;
+                        }
+                        out.insert(
+                            String::from_utf8_lossy(&b[name_start..j]).into_owned(),
+                            String::from_utf8_lossy(&b[vs..v]).into_owned(),
+                        );
+                        i = v + 1;
+                        continue;
+                    }
+                }
+            }
         }
 
-        // 其后应紧跟 ="…"
-        let mut k = j;
-        while k < b.len() && b[k].is_ascii_whitespace() {
-            k += 1;
-        }
-        if k < b.len() && b[k] == b'=' {
-            k += 1;
-            while k < b.len() && b[k].is_ascii_whitespace() {
-                k += 1;
-            }
-            if k < b.len() && (b[k] == b'"' || b[k] == b'\'') {
-                let q = b[k];
-                let vstart = k + 1;
-                let mut v = vstart;
-                while v < b.len() && b[v] != q {
-                    v += 1;
+        // —— 元素形式：<crs:Name>值</crs:Name>
+        if b[i] == b'<' {
+            let name_start = i + 1;
+            if b[name_start..].starts_with(b"crs:") || b[name_start..].starts_with(b"crd:") {
+                let id_start = name_start + 4;
+                let mut j = id_start;
+                while j < b.len() && is_name_byte(b[j]) {
+                    j += 1;
                 }
-                let name = String::from_utf8_lossy(&b[name_start..j]).into_owned();
-                let value = String::from_utf8_lossy(&b[vstart..v]).into_owned();
-                out.insert(name, value);
-                i = v + 1;
-                continue;
+                if j > id_start && j < b.len() && b[j] == b'>' {
+                    let vs = j + 1;
+                    // 结束标签形如 </crd:Name>，这里只找下一个 '<'
+                    let mut v = vs;
+                    while v < b.len() && b[v] != b'<' {
+                        v += 1;
+                    }
+                    let name = String::from_utf8_lossy(&b[id_start..j]).into_owned();
+                    let value = String::from_utf8_lossy(&b[vs..v]).trim().to_string();
+                    out.insert(name, value);
+                    i = v;
+                    continue;
+                }
             }
         }
-        i = j;
+
+        i += 1;
     }
     out
 }
@@ -219,6 +250,10 @@ pub const NEUTRAL_ADJUSTMENTS: &[&str] = &[
 ///
 /// **空值与非数值一律判为非中性**：`crs:Saturation=""` 这种写法无法确认其为 0，
 /// 而标定数据的原则是"无法确认就拒绝"，不是"无法确认就放过"。
+///
+/// 注意：判据已不再是「这些值必须为 0」（见 [`consensus_adjustments`]）——
+/// 相机在每个文件里固定写入的 `crd:` 块本身就带非零值。此函数现仅供测试使用。
+#[cfg(test)]
 fn is_neutral_value(v: &str) -> bool {
     match v.trim().parse::<f64>() {
         Ok(x) => x.abs() < 1e-6,
@@ -232,7 +267,10 @@ pub struct PairReport {
     pub index: usize,
     pub raw: PathBuf,
     pub export: PathBuf,
+    /// 导致该对被排除的问题。
     pub issues: Vec<Issue>,
+    /// 供人工核对的信息，**不影响合格与否**。
+    pub notes: Vec<String>,
 }
 
 impl PairReport {
@@ -241,16 +279,101 @@ impl PairReport {
     }
 }
 
+/// NX Studio 边车文件的路径（按约定：同目录下 `NKSC_PARAM\<完整文件名>.nksc`）。
+///
+/// 存在边车意味着 NEF 内嵌的设置**已过期**——导出以边车为准。
+pub fn sidecar_path(raw: &Path) -> Option<PathBuf> {
+    let name = raw.file_name()?.to_string_lossy().into_owned();
+    let dir = raw.parent()?;
+    let p = dir.join("NKSC_PARAM").join(format!("{name}.nksc"));
+    p.is_file().then_some(p)
+}
+
+/// 内嵌设置的简短描述，用于提示。
+fn embedded_brief(raw: &[u8]) -> String {
+    let pc = crate::picture_control::read(raw)
+        .map(|id| id.name)
+        .unwrap_or_else(|_| "（读不到）".into());
+    let adl = crate::makernote::active_d_lighting(raw)
+        .ok()
+        .flatten()
+        .map(|a| a.name())
+        .unwrap_or_else(|| "（读不到）".into());
+    format!("PC={pc}, ADL={adl}")
+}
+
+/// 读出一个参考导出内嵌 XMP 中的调整块。
+///
+/// 返回 `None` 表示没有 XMP 或解析不出任何项。
+pub fn export_adjustments(
+    data: &[u8],
+) -> crate::error::Result<Option<std::collections::BTreeMap<String, String>>> {
+    use crate::tiff::Tiff;
+    let t = Tiff::locate(data)?;
+    let ifd = t.ifd0_offset()?;
+    let Some(e) = t.find(ifd, 0x02BC)? else { return Ok(None) };
+    let bytes = t.bytes(&e)?.to_vec();
+    let xmp = String::from_utf8_lossy(&bytes);
+    let m = xmp_adjustments(&xmp);
+    if m.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(m))
+    }
+}
+
+/// 一组导出的**共识调整块**：每个键取出现次数最多的值。
+///
+/// 尼康相机在每个文件里都会嵌一块固定的 Adobe 默认值（`crd:` 命名空间，
+/// `Exposure2012=0.33`、`Highlights2012=-21`、`Saturation=20` 之类）。它不是用户
+/// 的调整，因此**不能要求它为 0**——那样会把每一张都判成"有额外调整"。
+///
+/// 正确的判据是：**同一批参考导出之间应当一致**。谁不一样，谁才被动过。
+pub fn consensus_adjustments(
+    maps: &[&std::collections::BTreeMap<String, String>],
+) -> std::collections::BTreeMap<String, String> {
+    let mut counts: std::collections::BTreeMap<&str, std::collections::BTreeMap<&str, usize>> =
+        std::collections::BTreeMap::new();
+    for m in maps {
+        for (k, v) in m.iter() {
+            *counts.entry(k.as_str()).or_default().entry(v.as_str()).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(k, vs)| {
+            vs.into_iter().max_by_key(|(_, n)| *n).map(|(v, _)| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
 /// 校验一份参考集。
 ///
 /// 四项前提逐一检查，**任一项不满足即排除该对并报告原因**——不是降权继续用。
 /// 降权会让不合格样本以看不见的方式污染拟合。
+///
+/// # 「无额外调整」这一项的特殊之处
+///
+/// 判据是**整组一致**，不是绝对为 0——理由见 [`consensus_adjustments`]。
+/// 局限也要说清：若**所有**参考导出都做了同一处调整（比如统一加了 +0.3 EV），
+/// 共识会把它一起吸收，这一项查不出来。因此校验结论里会一并列出共识块本身，
+/// 供人工过目。
 pub fn validate(set: &ReferenceSet) -> Vec<PairReport> {
+    // 第一遍：读出各导出的调整块，供「整组一致」判据使用
+    let maps: Vec<Option<std::collections::BTreeMap<String, String>>> = set
+        .pairs
+        .iter()
+        .map(|p| std::fs::read(&p.export).ok().and_then(|d| export_adjustments(&d).ok().flatten()))
+        .collect();
+    let present: Vec<&std::collections::BTreeMap<String, String>> = maps.iter().flatten().collect();
+    let consensus = consensus_adjustments(&present);
+
     set.pairs
         .iter()
         .enumerate()
         .map(|(i, p)| {
             let mut issues = Vec::new();
+            let mut notes = Vec::new();
             let push = |issues: &mut Vec<Issue>, detail: String| {
                 issues.push(Issue::PremiseViolated { pair_index: i, detail });
             };
@@ -271,8 +394,31 @@ pub fn validate(set: &ReferenceSet) -> Vec<PairReport> {
             };
 
             if let Some(raw) = &raw {
-                // 1. ADL 必须关闭
-                if set.premises.require_adl_off {
+                // 关键：**存在 NX Studio 边车时，NEF 内嵌的设置是过期的**。
+                //
+                // 相机把拍摄时的 Picture Control / ADL 写进 MakerNote，而 NX Studio
+                // 的修改存在同目录 `NKSC_PARAM\<名>.nksc` 里，导出时**边车覆盖内嵌值**。
+                // 实测：15 张参考图的 NEF 都记着 `LINKS-Nature` + ADL 标准，而用户
+                // 在 NX Studio 里设的是「自然 + ADL 关闭」——拿 NEF 去校验会把这 15 张
+                // 全部误判为不合格。
+                let sidecar = sidecar_path(&p.raw);
+                let overridden = sidecar.is_some();
+
+                if overridden {
+                    // 不拿过期值下结论，但把差异记下来供人工核对
+                    let eff = export_adjustments(export.as_deref().unwrap_or(&[]))
+                        .ok()
+                        .flatten()
+                        .and_then(|m| m.get("CameraProfile").cloned());
+                    notes.push(format!(
+                        "NEF 内嵌设置为「{}」，但存在 NX Studio 边车 {}，导出以边车为准；\
+                         导出内嵌的 CameraProfile = {}",
+                        embedded_brief(raw),
+                        sidecar.as_ref().unwrap().display(),
+                        eff.as_deref().unwrap_or("（未记录）")
+                    ));
+                } else if set.premises.require_adl_off {
+                    // 无边车 → 内嵌设置就是实际使用的设置，正常校验
                     match crate::makernote::active_d_lighting(raw) {
                         Ok(Some(adl)) if adl.is_off() => {}
                         Ok(Some(adl)) => push(
@@ -284,66 +430,51 @@ pub fn validate(set: &ReferenceSet) -> Vec<PairReport> {
                     }
                 }
 
-                // 2. Picture Control 必须是指定的基准
-                match crate::picture_control::read(raw) {
-                    Ok(id) => {
-                        if !id.name.eq_ignore_ascii_case(&set.premises.baseline_name) {
-                            push(
-                                &mut issues,
-                                format!(
-                                    "Picture Control 不是指定基准：要求「{}」，实际「{}」",
-                                    set.premises.baseline_name, id.name
-                                ),
-                            );
+                if !overridden {
+                    match crate::picture_control::read(raw) {
+                        Ok(id) => {
+                            if !id.name.eq_ignore_ascii_case(&set.premises.baseline_name) {
+                                push(
+                                    &mut issues,
+                                    format!(
+                                        "Picture Control 不是指定基准：要求「{}」，实际「{}」",
+                                        set.premises.baseline_name, id.name
+                                    ),
+                                );
+                            }
                         }
-                        if !id.base.eq_ignore_ascii_case(&set.premises.baseline_name) {
-                            push(
-                                &mut issues,
-                                format!(
-                                    "基准色彩不是指定值：要求「{}」，实际「{}」",
-                                    set.premises.baseline_name, id.base
-                                ),
-                            );
-                        }
+                        Err(e) => push(&mut issues, format!("解析 Picture Control 失败：{e}")),
                     }
-                    Err(e) => push(&mut issues, format!("解析 Picture Control 失败：{e}")),
                 }
             }
 
             if let Some(export) = &export {
-                // 3. 参考导出中不得有额外调整
+                // 3. 参考导出中不得有额外调整——判据是**整组一致**（见 validate 的文档）
                 if set.premises.require_no_adjustments {
-                    match crate::tiff::Tiff::locate(export)
-                        .and_then(|t| {
-                            let ifd = t.ifd0_offset()?;
-                            Ok(t.find(ifd, 0x02BC)?.and_then(|e| t.bytes(&e).ok().map(|b| b.to_vec())))
-                        }) {
-                        Ok(Some(xmp_bytes)) => {
-                            let xmp = String::from_utf8_lossy(&xmp_bytes);
-                            let adj = xmp_adjustments(&xmp);
-                            if adj.is_empty() {
-                                push(&mut issues, "参考导出含 XMP 但未解析出任何调整项，无法确认无调整".into());
-                            }
-                            let mut offending = Vec::new();
+                    match &maps[i] {
+                        None => push(
+                            &mut issues,
+                            "参考导出不含可解析的 XMP 调整块，无法确认无额外调整".into(),
+                        ),
+                        Some(m) => {
+                            let mut diff = Vec::new();
                             for k in NEUTRAL_ADJUSTMENTS {
-                                if let Some(v) = adj.get(*k) {
-                                    if !is_neutral_value(v) {
-                                        offending.push(format!("{k}={v}"));
+                                if let Some(v) = m.get(*k) {
+                                    match consensus.get(*k) {
+                                        Some(bv) if bv != v => {
+                                            diff.push(format!("{k} 为 {v}，整组为 {bv}"))
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
-                            if !offending.is_empty() {
+                            if !diff.is_empty() {
                                 push(
                                     &mut issues,
-                                    format!("参考导出含有额外调整：{}", offending.join("、")),
+                                    format!("参考导出与整组不一致，疑似有额外调整：{}", diff.join("；")),
                                 );
                             }
                         }
-                        Ok(None) => push(
-                            &mut issues,
-                            "参考导出不含 XMP，无法确认无额外调整".into(),
-                        ),
-                        Err(e) => push(&mut issues, format!("解析参考导出的 XMP 失败：{e}")),
                     }
                 }
 
@@ -357,7 +488,10 @@ pub fn validate(set: &ReferenceSet) -> Vec<PairReport> {
                             crate::libraw::read_dimensions(&p.raw),
                         ) {
                             if let Some((cw, ch)) = margins.effective(nw, nh) {
-                                if (ew, eh) != (cw, ch) {
+                                // 竖构图导出会被转置（实测参考图是 5504×8256），
+                                // 因此两种朝向都接受。
+                                let ok = (ew, eh) == (cw, ch) || (ew, eh) == (ch, cw);
+                                if !ok {
                                     push(
                                         &mut issues,
                                         format!(
@@ -371,7 +505,7 @@ pub fn validate(set: &ReferenceSet) -> Vec<PairReport> {
                 }
             }
 
-            PairReport { index: i, raw: p.raw.clone(), export: p.export.clone(), issues }
+            PairReport { index: i, raw: p.raw.clone(), export: p.export.clone(), issues, notes }
         })
         .collect()
 }

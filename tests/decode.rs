@@ -433,7 +433,50 @@ fn camera_matrix_varies_with_white_balance() {
     assert!(b.rgb_cam.iter().flatten().all(|v| v.is_finite()));
 }
 
-/// 5.1 在真实样本上的验证：`DSC_4143` 的 ADL 是「标准」而非关闭，
+/// 5.1 的最终验收：对**真实的 15 对**参考导出（用户用 NX Studio 以「自然 + ADL 关闭」
+/// 导出到 `simple/`）跑校验，全部应通过。
+#[test]
+fn the_manual_reference_exports_pass_validation() {
+    let dir = samples_dir();
+    let mut set = nikonrawview::calibrate::ReferenceSet::default();
+    for i in 1..=15 {
+        let n = format!("DSC_{i:04}");
+        let raw = dir.join(format!("{n}.NEF"));
+        let export = dir.join(format!("{n}.TIF"));
+        if !raw.is_file() || !export.is_file() {
+            eprintln!("跳过：缺少 {n} 的 NEF 或 TIF");
+            return;
+        }
+        set.pairs.push(nikonrawview::calibrate::ReferencePair { raw, export });
+    }
+
+    let reports = nikonrawview::calibrate::validate(&set);
+    let mut bad = 0;
+    for r in &reports {
+        if r.is_ok() {
+            continue;
+        }
+        bad += 1;
+        eprintln!("✗ {}", r.raw.file_name().unwrap().to_string_lossy());
+        for i in &r.issues {
+            eprintln!("    {}", i.describe());
+        }
+    }
+    eprintln!("校验 {} 对：合格 {}，不合格 {}", reports.len(), reports.len() - bad, bad);
+
+    // 顺带报告共识调整块——若整组都被做了同一处调整，这一项查不出来，需人工过目
+    let d = std::fs::read(&set.pairs[0].export).unwrap();
+    if let Ok(Some(m)) = nikonrawview::calibrate::export_adjustments(&d) {
+        eprintln!("导出内嵌的调整块（相机固定写入，共 {} 项）：", m.len());
+        for (k, v) in &m {
+            if nikonrawview::calibrate::NEUTRAL_ADJUSTMENTS.contains(&k.as_str()) {
+                eprintln!("    {k} = {v}");
+            }
+        }
+    }
+
+    assert_eq!(bad, 0, "{bad} 对未通过校验");
+}
 /// 因此它**必须**被拒绝作为参考导出——这正是校验要拦住的第一种情况。
 #[test]
 fn real_sample_is_rejected_as_reference_because_adl_is_on() {
