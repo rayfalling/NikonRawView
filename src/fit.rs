@@ -257,6 +257,58 @@ impl CurveDiagnosis {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 感知均匀的编码域
+// ---------------------------------------------------------------------------
+
+/// 线性 → sRGB 编码（0..1 → 0..1）。
+///
+/// # 为什么曲线要在这个域上拟合
+///
+/// 第一版按**线性**域等距分箱：128 箱覆盖 0..1，箱宽 0.0078。实测 ΔE00 中位数
+/// 2.097、P95 5.944，**未达标**，且最大误差全在深阴影（输入 0.02–0.04、参考
+/// 0.09–0.13，差 4~5 倍）。
+///
+/// 根因是定义域：线性 0.023 对应 L*≈18、线性 0.119 对应 L*≈42——同一个箱宽在阴影处
+/// 的感知跨度比在高光处大一个数量级。**用线性等距的网格去拟合感知上高度不均匀的
+/// 映射，阴影段必然欠拟合。**
+///
+/// 编码域里等距的箱对应的感知跨度大致相当，阴影与高光因此得到相称的分辨率。
+pub fn encode_srgb(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    if x <= 0.003_130_8 {
+        12.92 * x
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// sRGB 编码 → 线性。
+pub fn decode_srgb(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    if x <= 0.040_45 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// 曲线的前向施加：**编码 → 查曲线 → 解码**。
+///
+/// 曲线的定义域与值域都是 0..1 的**编码值**，而管线其余部分走线性，因此这里必须做
+/// 两次转换。少了任何一次，曲线都会作用在错误的定义域上——而那种错误不会报错，
+/// 只会让画面整体偏亮或偏暗。
+pub fn forward_curve(curve: &[f32], v: [f32; 3]) -> [f32; 3] {
+    if curve.len() < 2 {
+        return v;
+    }
+    [
+        decode_srgb(apply_curve(curve, encode_srgb(v[0]))),
+        decode_srgb(apply_curve(curve, encode_srgb(v[1]))),
+        decode_srgb(apply_curve(curve, encode_srgb(v[2]))),
+    ]
+}
+
 /// 拟合一维色调曲线。
 ///
 /// # 做法与取舍
@@ -267,15 +319,15 @@ impl CurveDiagnosis {
 /// 强制单调的理由：基准渲染本身是单调的，非单调的拟合结果只可能来自噪声。放它过去
 /// 会让画面出现局部反转的"色带"，而这种缺陷很难在缩略图上被发现。
 ///
-/// 返回 `bins + 1` 个采样点，定义域与值域都是 0..1。
+/// 返回 `bins + 1` 个采样点，定义域与值域都是 0..1 的**编码值**。
 pub fn fit_curve(samples: &[Sample], bins: usize) -> Vec<f32> {
     let bins = bins.max(2);
     let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); bins];
     for s in samples {
         for k in 0..3 {
-            let x = s.ours[k].clamp(0.0, 1.0);
+            let x = encode_srgb(s.ours[k]);
             let b = ((x * bins as f32) as usize).min(bins - 1);
-            buckets[b].push(s.theirs[k].clamp(0.0, 1.0));
+            buckets[b].push(encode_srgb(s.theirs[k]));
         }
     }
 
@@ -332,6 +384,31 @@ pub fn fit_curve(samples: &[Sample], bins: usize) -> Vec<f32> {
     out
 }
 
+/// LUT 网格坐标：**编码域**等距。
+///
+/// # 为什么网格索引必须走编码域
+///
+/// 曲线早就搬到编码域了，但 LUT 曾经仍按**线性值**分格（`x * (edge-1)`）。后果实测：
+/// 17³ = 4913 个格子**只有 220 个有样本，95.52% 是空的**；暗角格 (0,0,0) 吃掉
+/// **34.35%** 的样本，其 ΔE00 中位 4.70（全局 2.16 倍），占坏尾部的 **72.29%**。
+///
+/// 更关键的是分阶段归因（同一评估集，暗部最暗 10%）：
+///
+/// ```text
+/// 恒等 ΔE00 1.61  →  仅曲线 1.87  →  曲线 + LUT 5.56
+/// 中位 Y   0.0068  →      0.0075  →           0.0186      参考 0.0072
+/// ```
+///
+/// 即**原始解码与曲线在深阴影里都是对的，是 LUT 把深阴影抬亮了 2.6 倍**——因为整个
+/// 暗部被压进同一个格子，而节点值取的是**格内样本的中位数**，那些更亮的样本把节点
+/// 抬高，插值再把抬高的节点摊回整个暗部。
+///
+/// 索引搬到编码域后，暗部样本分散到多个格子，每格内的取值范围大幅收窄，中位数才
+/// 真正代表该节点。
+fn lut_coord(x: f32, edge: usize) -> f32 {
+    encode_srgb(x) * (edge - 1) as f32
+}
+
 /// 在采样点上对曲线求值（线性插值）。
 pub fn apply_curve(curve: &[f32], x: f32) -> f32 {
     if curve.len() < 2 {
@@ -366,16 +443,12 @@ pub fn fit_lut(samples: &[Sample], curve: &[f32], edge: usize) -> Vec<f32> {
     let mut cnt = vec![0u32; n];
 
     let idx = |v: [f32; 3]| -> usize {
-        let q = |x: f32| ((x.clamp(0.0, 1.0) * (edge - 1) as f32).round() as usize).min(edge - 1);
+        let q = |x: f32| (lut_coord(x, edge).round() as usize).min(edge - 1);
         (q(v[0]) * edge + q(v[1])) * edge + q(v[2])
     };
 
     for s in samples {
-        let c = [
-            apply_curve(curve, s.ours[0]),
-            apply_curve(curve, s.ours[1]),
-            apply_curve(curve, s.ours[2]),
-        ];
+        let c = forward_curve(curve, s.ours);
         let i = idx(c);
         for (k, t) in s.theirs.iter().enumerate() {
             sum[i][k] += *t as f64;
@@ -478,7 +551,7 @@ pub fn apply_lut(lut: &[f32], edge: usize, v: [f32; 3]) -> [f32; 3] {
         return v;
     }
     let f = |x: f32| -> (usize, usize, f32) {
-        let p = x.clamp(0.0, 1.0) * (edge - 1) as f32;
+        let p = lut_coord(x, edge);
         let i = (p.floor() as usize).min(edge - 2);
         (i, i + 1, p - i as f32)
     };

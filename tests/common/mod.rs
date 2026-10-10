@@ -58,6 +58,154 @@ pub fn skip(test: &str, name: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// 诊断脚手架
+// ---------------------------------------------------------------------------
+
+/// 一个诊断样本。
+#[derive(Debug, Clone, Copy)]
+pub struct DiagSample {
+    /// 我们的**原始**线性工作空间值（未经基准变换）。
+    pub ours_linear: [f32; 3],
+    /// 施加基准变换之后的值。
+    pub ours_transformed: [f32; 3],
+    /// 参考导出的线性工作空间值。
+    pub theirs_linear: [f32; 3],
+    /// 像素在图像中的位置（裁剪后坐标），便于回看具体区域。
+    pub xy: (usize, usize),
+}
+
+/// 拟合产物 + 评估样本。
+pub struct FittedFixture {
+    pub transform: nikonrawview::transform::BaseTransform,
+    pub eval: Vec<DiagSample>,
+    pub fit_count: usize,
+    /// 参考图与解码图的尺寸，便于诊断报告写清上下文。
+    pub size: (usize, usize),
+}
+
+impl DiagSample {
+    /// 亮度（Rec.709 权重，作用于我们的原始线性值）。
+    pub fn lum_ours(&self) -> f32 {
+        0.2126 * self.ours_linear[0] + 0.7152 * self.ours_linear[1] + 0.0722 * self.ours_linear[2]
+    }
+    /// 参考的亮度。
+    pub fn lum_theirs(&self) -> f32 {
+        0.2126 * self.theirs_linear[0] + 0.7152 * self.theirs_linear[1] + 0.0722 * self.theirs_linear[2]
+    }
+    /// 该样本的 ΔE00（变换后 vs 参考）。
+    pub fn delta_e(&self) -> f64 {
+        nikonrawview::deltae::delta_e_prophoto(self.ours_transformed, self.theirs_linear)
+    }
+}
+
+/// 构建 `DSC_0001` 的拟合产物与留出评估集。
+///
+/// **拟合与评估用不同的像素子集**——即便正式划分（5.6）尚未落地，也不该拿"背下来的
+/// 答案"来评估自己。
+///
+/// 三条诊断共用这一份，避免各自重跑一遍解码（一张 45 MP 的 NEF 解码约 20 秒，
+/// 参考 TIF 有 260 MB）。
+pub fn fitted_neutral_fixture() -> Option<FittedFixture> {
+    fitted_fixture_for("DSC_0001", true)
+}
+
+/// 构建 `stem` 的拟合产物与留出评估集。
+///
+/// `do_fit` 为 false 时只收集样本、不拟合——用于「拿 A 图拟合出的变换去套 B 图」的
+/// 跨图验证。返回值里的 `transform` 此时是恒等，调用方应自行提供变换。
+pub fn fitted_fixture_for(stem: &str, do_fit: bool) -> Option<FittedFixture> {
+    let dir = samples_dir();
+    let nef = dir.join(format!("{stem}.NEF"));
+    let tif = dir.join(format!("{stem}.TIF"));
+    if !nef.is_file() || !tif.is_file() {
+        skip("诊断脚手架", &format!("{stem}.NEF / {stem}.TIF"));
+        return None;
+    }
+
+    let tif_data = std::fs::read(&tif).ok()?;
+    let img = nikonrawview::fit::read_rgb16(&tif_data).ok()?;
+    let plan = nikonrawview::icc::plan_for(&tif_data).ok()?;
+    let opts = nikonrawview::libraw::Options {
+        demosaic: nikonrawview::libraw::Demosaic::Dht,
+        user_mul: None,
+    };
+    let dec = nikonrawview::libraw::decode_working_space(&nef, &opts).ok()?;
+    let model = nikonrawview::camera::read_model(&nef)?;
+    let entry = nikonrawview::camera::lookup(&model)?;
+    let mg = if dec.rotated { entry.margins.rotated() } else { entry.margins };
+    let (cw, ch) = mg.effective(dec.width, dec.height)?;
+    let theirs = nikonrawview::fit::reference_to_working(&img, &plan);
+
+    let mut fit_samples = Vec::new();
+    let mut heldout = Vec::new();
+    let mut k = 0usize;
+    for y in (0..ch).step_by(13) {
+        for x in (0..cw).step_by(13) {
+            let j = x + y * img.width;
+            let Some(p) = dec.at(x + mg.left, y + mg.top) else { continue };
+            let ours = [
+                p[0] as f32 / 65535.0,
+                p[1] as f32 / 65535.0,
+                p[2] as f32 / 65535.0,
+            ];
+            k += 1;
+            if k % 2 == 0 {
+                fit_samples.push(nikonrawview::fit::Sample { ours, theirs: theirs[j] });
+            } else {
+                heldout.push((ours, theirs[j], (x, y)));
+            }
+        }
+    }
+
+    let curve = nikonrawview::fit::fit_curve(&fit_samples, 128);
+    let edge = 17;
+    let lut = nikonrawview::fit::fit_lut(&fit_samples, &curve, edge);
+    let transform = if do_fit {
+        nikonrawview::transform::BaseTransform::from_fit(
+            0x0000,
+            "NEUTRAL",
+            vec![format!("simple/{stem}.NEF + simple/{stem}.TIF")],
+            curve,
+            edge,
+            lut,
+        )
+    } else {
+        // 只收样本，不拟合——跨图验证时调用方会提供在别处拟合出的变换
+        nikonrawview::transform::BaseTransform::new(0x0000, "未拟合")
+    };
+
+    let eval = heldout
+        .into_iter()
+        .map(|(o, t, xy)| DiagSample {
+            ours_linear: o,
+            ours_transformed: transform.apply(o),
+            theirs_linear: t,
+            xy,
+        })
+        .collect();
+
+    Some(FittedFixture {
+        transform,
+        eval,
+        fit_count: fit_samples.len(),
+        size: (cw, ch),
+    })
+}
+
+/// 计算一组 ΔE00 的中位数 / P95 / 最大值。
+pub fn quantiles(values: &mut [f64]) -> (f64, f64, f64) {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if values.is_empty() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let at = |q: f64| {
+        let rank = (q * values.len() as f64).ceil().max(1.0) as usize;
+        values[rank.saturating_sub(1).min(values.len() - 1)]
+    };
+    (at(0.5), at(0.95), *values.last().unwrap())
+}
+
+// ---------------------------------------------------------------------------
 // 合成文件构造器
 // ---------------------------------------------------------------------------
 

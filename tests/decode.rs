@@ -673,17 +673,16 @@ fn fitted_transform_reproduces_the_reference() {
     let lut = nikonrawview::fit::fit_lut(&samples, &curve, edge);
     assert_eq!(lut.len(), edge * edge * edge * 3);
 
-    // 残差：曲线 + LUT 之后与参考的差
+    // 注意：曲线工作在**编码域**，不能把它输出的值直接与线性参考比。
+    // 必须走 forward_curve（编码 → 查曲线 → 解码）才是同口径。
+    // 这里曾经直接调 apply_curve，曲线搬到编码域后该口径失效，读出的 0.086 是度量错误
+    // 而非实现退步。
     let mut sum = 0f64;
     let mut worst = 0f64;
     let mut n = 0u64;
     let mut before = 0f64;
     for s in &samples {
-        let c = [
-            nikonrawview::fit::apply_curve(&curve, s.ours[0]),
-            nikonrawview::fit::apply_curve(&curve, s.ours[1]),
-            nikonrawview::fit::apply_curve(&curve, s.ours[2]),
-        ];
+        let c = nikonrawview::fit::forward_curve(&curve, s.ours);
         let out = nikonrawview::fit::apply_lut(&lut, edge, c);
         for k in 0..3 {
             let e = (out[k] - s.theirs[k]).abs() as f64;

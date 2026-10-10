@@ -82,15 +82,7 @@ impl BaseTransform {
     /// 顺序不是随便定的——曲线负责明暗、LUT 是在曲线之后拟合出来的，它接收的正是
     /// 曲线之后的 RGB。反过来施加会让 LUT 落在它没被拟合过的定义域上。
     pub fn apply(&self, v: [f32; 3]) -> [f32; 3] {
-        let c = if self.curve.len() < 2 {
-            v
-        } else {
-            [
-                crate::fit::apply_curve(&self.curve, v[0]),
-                crate::fit::apply_curve(&self.curve, v[1]),
-                crate::fit::apply_curve(&self.curve, v[2]),
-            ]
-        };
+        let c = crate::fit::forward_curve(&self.curve, v);
         if self.lut_edge < 2 || self.lut.is_empty() {
             c
         } else {
