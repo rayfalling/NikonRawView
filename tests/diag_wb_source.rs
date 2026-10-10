@@ -141,6 +141,14 @@ fn cam_mul_matches_nikons_own_wb_levels() {
             eprintln!("       WB_RBLevels 原始 {} 字节：{:02X?}", r.len(), &r[..r.len().min(24)]);
         }
 
+        // 黑电平：LibRaw 的唯一来源就是 MakerNote tag 0x003d，用同一个解析器读它。
+        // 诊断 L 已从源码确证 LibRaw 读的就是这里，且逐通道扣、只扣一次、整数、钳到 0。
+        match makernote::black_level(&data) {
+            Ok(Some(bl)) => eprintln!("       黑电平：{}", bl.describe()),
+            Ok(None) => eprintln!("       黑电平：**读不到 tag 0x003d**（不要当成 0）"),
+            Err(e) => eprintln!("       黑电平：解析失败 {e}"),
+        }
+
         // 顺带看多重定义的变体与版本
         if let Ok(Some(b)) = makernote::tag_bytes(&data, TAG_WB_RBGGLEVELS) {
             let v = as_rationals(&b);
