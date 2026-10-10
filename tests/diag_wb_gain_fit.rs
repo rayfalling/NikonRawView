@@ -53,9 +53,19 @@
 //!
 //! # 运行
 //!
-//! 默认：普查全部配对 → 每档取一张代表 + 最大档多取几张（量档内离散）→ 逐图解码。
+//! 默认：普查全部配对 → 每档 1 张代表 + 多图档各补 1 张「编号相隔最远」的成员 +
+//! 最大的一档再补 1 张 → 逐图解码。**绝不为了预算丢档**；真超预算时打印丢了谁。
 //! `NRV_K_STEMS=DSC_0001,DSC_0141` 只跑指定图（迭代用，跳过普查）；
 //! `NRV_K_CENSUS=0` 跳过普查。
+//!
+//! # 本轮（诊断 M）的数据变化，以及**没有**变的东西
+//!
+//! 用户按建议拍了一组**色温扫描**（DSC_0561~0570），把 B/G 1.33~2.19 之间的点从 2 个补到 5 个，
+//! 最大相邻间隔从 47% 降到 23%。这解决的是**「红通道那段形状没被约束住」**的问题。
+//!
+//! 但它**没有**改善「跨场景」这一维：新样张是**同一场景**在不同色温下的扫描。
+//! 所以留一档 CV 仍然是**插值**（在相邻档之间），不是「换一个场景还成立」的验证。
+//! [1d] 把「近同档但不同图」的配对单独列出来，那是本批唯一能看跨场景的地方。
 
 mod common;
 
@@ -87,12 +97,22 @@ const RATIO_GATE: f32 = 1e-4;
 const MIN_SAMPLES: usize = 2000;
 
 /// 视作同一档白平衡的**相对** B/G 容差（0.5%）。
+///
+/// 这个容差决定了「留一档」到底留掉什么：容差越窄，档越碎、被留掉的那档在训练集里
+/// 越可能有**近乎相同**的近邻，CV 于是偏乐观。所以 [3b] 会把容差放宽再算一遍。
 const WB_LEVEL_TOL: f64 = 5e-3;
 
-/// 解码预算：每档一张代表之外，最多再补几张（用来量档内离散）。
-const EXTRA_PER_BIGGEST: usize = 3;
-/// 解码总预算上限。
-const MAX_IMAGES: usize = 12;
+/// 多图档额外补几张。补的那张取**编号与该档代表相隔最远**的成员——那是「不同拍摄批次/
+/// 不同场景」在本数据里唯一可用的代理，用来检验「同白平衡、不同场景是否给出同一个 w」。
+const EXTRA_PER_MULTI: usize = 1;
+/// 最大的一档再补一张，保证连拍档至少有 3 张可量档内离散。
+const EXTRA_PER_BIGGEST: usize = 1;
+/// 解码总预算上限。**超出时先丢额外补的图并打印丢了谁，绝不静默丢档**。
+const MAX_IMAGES: usize = 22;
+/// [1d] 近同档配对用的 B/G 相对容差。
+const NEAR_BG_TOL: f64 = 0.03;
+/// [3b] 档容差敏感性检查用的更宽容差。
+const TOL_SENSITIVITY: [f64; 2] = [0.01, 0.02];
 
 /// 「曲线可用」的门槛：留一档交叉验证的相对误差中位数。
 const ERR_USABLE: f64 = 0.05;
@@ -560,22 +580,35 @@ fn observe(stem: &str, m0: Mat3) -> Option<ImageData> {
 // ---------------------------------------------------------------------------
 
 /// `simple/` 下所有「NEF + 配对 TIF」的白平衡，按 B/G 升序。
+///
+/// 顺带报出**有 TIF 却找不到 NEF** 的文件：那种参考导出无法配对，值得知道。
 fn pair_census() -> Vec<(String, f64, f64)> {
     let dir = samples_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().map(|x| x.eq_ignore_ascii_case("nef")) != Some(true) {
-            continue;
+    let all: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    let nefs: Vec<std::path::PathBuf> = all
+        .iter()
+        .filter(|p| p.extension().map(|x| x.eq_ignore_ascii_case("nef")).unwrap_or(false))
+        .cloned()
+        .collect();
+    for tif in all
+        .iter()
+        .filter(|p| p.extension().map(|x| x.eq_ignore_ascii_case("tif")).unwrap_or(false))
+    {
+        if !nefs.iter().any(|n| n.with_extension("NEF") == tif.with_extension("NEF")) {
+            eprintln!("  普查：{} 有 TIF 但没有配对 NEF，无法使用", tif.display());
         }
+    }
+
+    let mut out = Vec::new();
+    for p in &nefs {
         if !p.with_extension("TIF").is_file() {
             continue;
         }
         let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        match libraw::read_wb(&p) {
+        match libraw::read_wb(p) {
             Ok(w) if w[1] > 0.0 => out.push((stem, (w[0] / w[1]) as f64, (w[2] / w[1]) as f64)),
             Ok(_) => eprintln!("  普查：{stem} 的 cam_mul G 非正，跳过"),
             Err(e) => eprintln!("  普查：{stem} 读白平衡失败（{e}）"),
@@ -629,25 +662,70 @@ fn print_census(census: &[(String, f64, f64)]) -> Vec<Vec<usize>> {
     levels
 }
 
-/// 每档取一张代表；最大的一档再多取几张（量档内离散）。
-fn choose_stems(census: &[(String, f64, f64)], levels: &[Vec<usize>]) -> Vec<String> {
-    let mut chosen: Vec<String> = Vec::new();
+/// 从 `DSC_0001` 这类名字里取编号，用于判断两张图「相隔多远」。
+fn stem_number(s: &str) -> Option<u32> {
+    s.rsplit('_').next()?.parse::<u32>().ok()
+}
+
+/// 选图。规则（确定性、可复核）：
+///
+/// 1. **每一档都要一张代表**（档按字母序取第一张）——绝不为了让预算好看而丢档；
+/// 2. 多图档再补一张**编号与该档代表相隔最远**的成员：那是「不同拍摄批次/不同场景」
+///    在本数据里唯一可用的代理，用来检验「同白平衡、不同场景是否给出同一个 w」；
+/// 3. 最大的一档再补一张，保证连拍档至少有 3 张可量档内离散；
+/// 4. 超过 [`MAX_IMAGES`] 时**先丢额外补的图，并打印丢了谁**。
+fn choose_stems(
+    census: &[(String, f64, f64)],
+    levels: &[Vec<usize>],
+) -> (Vec<String>, Vec<String>) {
+    let names = |g: &Vec<usize>| -> Vec<String> {
+        let mut m: Vec<String> = g.iter().map(|&i| census[i].0.clone()).collect();
+        m.sort_unstable();
+        m
+    };
+    let farthest = |members: &[String], rep: &str| -> Option<String> {
+        let rn = stem_number(rep)?;
+        members
+            .iter()
+            .filter(|m| m.as_str() != rep)
+            .filter_map(|m| stem_number(m).map(|n| (n.abs_diff(rn), m.clone())))
+            .max_by_key(|(d, _)| *d)
+            .map(|(_, s)| s)
+    };
+
+    let mut reps: Vec<String> = Vec::new();
+    let mut extras: Vec<String> = Vec::new();
     for g in levels {
-        let mut members: Vec<&str> = g.iter().map(|&i| census[i].0.as_str()).collect();
-        members.sort_unstable();
-        if let Some(s) = members.first() {
-            chosen.push((*s).to_string());
+        let members = names(g);
+        let Some(rep) = members.first() else { continue };
+        reps.push(rep.clone());
+        if members.len() > 1 {
+            if let Some(f) = farthest(&members, rep) {
+                extras.push(f);
+            }
         }
     }
     if let Some(g) = levels.iter().max_by_key(|g| g.len()) {
-        let mut members: Vec<&str> = g.iter().map(|&i| census[i].0.as_str()).collect();
-        members.sort_unstable();
-        for s in members.iter().skip(1).take(EXTRA_PER_BIGGEST) {
-            chosen.push((*s).to_string());
+        let members = names(g);
+        if let Some(rep) = members.first() {
+            if let Some(f) = farthest(&members, rep) {
+                extras.push(f);
+            }
         }
     }
-    chosen.truncate(MAX_IMAGES);
-    chosen
+    extras.retain(|s| !reps.contains(s));
+    extras.dedup();
+
+    let mut chosen = reps;
+    let mut notes = Vec::new();
+    for e in extras {
+        if chosen.len() < MAX_IMAGES {
+            chosen.push(e);
+        } else {
+            notes.push(format!("预算 {MAX_IMAGES} 已满，丢掉额外补的 {e}"));
+        }
+    }
+    (chosen, notes)
 }
 
 // ---------------------------------------------------------------------------
@@ -813,12 +891,19 @@ fn fit_wb_dependent_gain() {
                 return;
             }
             let levels = print_census(&census);
-            let chosen = choose_stems(&census, &levels);
+            let (chosen, notes) = choose_stems(&census, &levels);
             eprintln!(
-                "\n     解码预算 {} 张：每档一张代表，最大的一档再补最多 {} 张（量档内离散）",
+                "\n     解码 {} 张：每档 1 张代表（{} 档），多图档各补 {EXTRA_PER_MULTI} 张「编号相隔最远」的成员（不同场景代理），",
                 chosen.len(),
-                EXTRA_PER_BIGGEST
+                levels.len()
             );
+            eprintln!(
+                "     最大的一档再补 {EXTRA_PER_BIGGEST} 张以量档内离散；上限 {MAX_IMAGES} 张。"
+            );
+            for n in &notes {
+                eprintln!("     ⚠ {n}");
+            }
+            eprintln!("     实际选中：{}", chosen.join(" "));
             chosen
         }
     };
@@ -909,6 +994,77 @@ fn fit_wb_dependent_gain() {
     }
     if !any_multi {
         eprintln!("    （每档只有一张图，无法量档内离散）");
+    }
+    // 档内散度的总括（后面判读要用）：所有多图档的 w 相对跨度的最大值
+    let mut scatter_r = f64::NAN;
+    let mut scatter_b = f64::NAN;
+    for g in &levels {
+        if g.len() < 2 {
+            continue;
+        }
+        let wr: Vec<f64> = g.iter().map(|&i| images[i].w_norm[0]).collect();
+        let wb: Vec<f64> = g.iter().map(|&i| images[i].w_norm[2]).collect();
+        let span = |v: &Vec<f64>| {
+            let lo = v.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            100.0 * (hi - lo) / lo
+        };
+        scatter_r = scatter_r.max(span(&wr));
+        scatter_b = scatter_b.max(span(&wb));
+    }
+
+    // ---- [1d] 近同档配对：同白平衡、不同图（含不同场景）的 w 是否一致 ----
+    eprintln!(
+        "\n[1d] 近同档配对（B/G 相对差 ≤ {:.0}%）：同白平衡但**不同图**的 w 是否一致",
+        NEAR_BG_TOL * 100.0
+    );
+    eprintln!("  这是本批数据里唯一能看「跨场景」的地方：色温扫描那批与老图场景不同。");
+    let biggest = levels.iter().max_by_key(|g| g.len()).cloned().unwrap_or_default();
+    eprintln!(
+        "  {:<10} {:<10} {:>9} {:>9} {:>9} {:>9}  场景关系",
+        "图 A", "图 B", "A 的B/G", "B 的B/G", "Δw_R", "Δw_B"
+    );
+    let mut near_pairs = 0usize;
+    let mut cross_scene: Vec<f64> = Vec::new();
+    let mut same_scene: Vec<f64> = Vec::new();
+    for i in 0..images.len() {
+        for j in (i + 1)..images.len() {
+            let (a, b) = (&images[i], &images[j]);
+            if (b.bg - a.bg).abs() / a.bg > NEAR_BG_TOL {
+                continue;
+            }
+            near_pairs += 1;
+            let dr = 100.0 * (b.w_norm[0] - a.w_norm[0]).abs() / a.w_norm[0];
+            let db = 100.0 * (b.w_norm[2] - a.w_norm[2]).abs() / a.w_norm[2];
+            let both_in_biggest = biggest.contains(&i) && biggest.contains(&j);
+            if both_in_biggest {
+                same_scene.push(dr.max(db));
+            } else {
+                cross_scene.push(dr.max(db));
+            }
+            eprintln!(
+                "  {:<10} {:<10} {:>9.4} {:>9.4} {:>8.2}% {:>8.2}%  {}",
+                a.stem,
+                b.stem,
+                a.bg,
+                b.bg,
+                dr,
+                db,
+                if both_in_biggest { "同档同场景（连拍）" } else { "同档，不同图/场景" }
+            );
+        }
+    }
+    if near_pairs == 0 {
+        eprintln!("    （没有 B/G 足够接近的配对）");
+    } else {
+        eprintln!(
+            "  ⇒ 最大差：同场景配对 {:.2}%（{} 对）· 跨图配对 {:.2}%（{} 对）",
+            max_of(&same_scene),
+            same_scene.len(),
+            max_of(&cross_scene),
+            cross_scene.len()
+        );
+        eprintln!("     跨图配对若与同场景配对同量级，说明 w 是白平衡档的属性、与场景无关。");
     }
 
     // ---- [2] 拟合 ----
@@ -1025,6 +1181,24 @@ fn fit_wb_dependent_gain() {
         median_of(&errs_b) / amp_b.max(1e-12)
     );
 
+    // ---- [3b] 档容差敏感性 ----
+    eprintln!("\n[3b] 档容差敏感性：近邻档会让「留一档」变得几乎不用外推，CV 因此偏乐观");
+    eprintln!("  主结果用 {:.1}% 容差；下面把容差放宽重算，看 CV 对「档怎么切」有多敏感。", WB_LEVEL_TOL * 100.0);
+    eprintln!("  {:<8} {:>5} {:>24} {:>24}", "容差", "档数", "w_R 中位/最坏", "w_B 中位/最坏");
+    for tol in std::iter::once(WB_LEVEL_TOL).chain(TOL_SENSITIVITY) {
+        let lv = group_by_bg(&bgs, tol);
+        let rows = cv_rows_leave_level(&images, &lv, form_r, form_b);
+        let er: Vec<f64> = rows.iter().map(|r| rel_err(r.predicted[0], r.measured[0])).collect();
+        let eb: Vec<f64> = rows.iter().map(|r| rel_err(r.predicted[2], r.measured[2])).collect();
+        eprintln!(
+            "  {:<8} {:>5} {:>23} {:>23}",
+            format!("{:.1}%", tol * 100.0),
+            lv.len(),
+            format!("{:.2}% / {:.2}%", 100.0 * median_of(&er), 100.0 * max_of(&er)),
+            format!("{:.2}% / {:.2}%", 100.0 * median_of(&eb), 100.0 * max_of(&eb))
+        );
+    }
+
     // ---- [3c] 功能后果 ----
     eprintln!("\n[3c] 功能后果（留出档上，尺度不变色度误差中位）：M0 原样 → 用预测 w → 用实测 w");
     eprintln!(
@@ -1132,12 +1306,13 @@ fn fit_wb_dependent_gain() {
         ("B", form_b, med_b, max_b, amp_b, ratio_b),
     ] {
         eprintln!(
-            "  通道 {label}：选中「{}」· CV 中位 {:.2}% / **最大 {:.2}%** · 修正幅度 {:.2}% · 误差÷幅度 {:.2}",
+            "  通道 {label}：选中「{}」· CV 中位 {:.2}% / **最大 {:.2}%** · 修正幅度 {:.2}% · 误差÷幅度 {:.2} · 档内噪声底 {:.2}%",
             form.name(),
             100.0 * med,
             100.0 * mx,
             100.0 * amp,
-            ratio
+            ratio,
+            if label == "R" { scatter_r } else { scatter_b }
         );
         if form == Form::Const || form == Form::Median {
             eprintln!("     ⇒ **该通道与 B/G 无关**：曲线跑不赢常数。");
@@ -1168,22 +1343,77 @@ fn fit_wb_dependent_gain() {
         pw.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
     );
     eprintln!(
-        "  w_R 在 B/G ≤ {:.4} 的 {} 张上几乎不动：{:.5} ~ {:.5}（跨 {:.2}%），对 2.87% 的修正幅度来说等于「不用修」；",
+        "  w_R 在 B/G ≤ {:.4} 的 {} 张上几乎不动：{:.5} ~ {:.5}（跨 {:.2}%），与 {:.2}% 的修正幅度相比等于「不用修」；",
         images[plateau].bg,
         plateau + 1,
         plo,
         phi,
-        100.0 * (phi - plo) / plo
+        100.0 * (phi - plo) / plo,
+        100.0 * amp_r
     );
-    eprintln!("  此后陡然下降：");
+    eprintln!("  此后逐档下降：");
     for im in images.iter().skip(plateau + 1) {
         eprintln!("      B/G {:>8.4}  →  w_R {:>9.5}（比高原低 {:>5.1}%）", im.bg, im.w_norm[0], 100.0 * (1.0 - im.w_norm[0] / phi));
     }
     let exp_b = fit_form(form_b, &points(&all, 2)).map(|f| f.b).unwrap_or(f64::NAN);
+    let (wb_lo, wb_hi) = (images[0].w_norm[2], images[images.len() - 1].w_norm[2]);
     eprintln!(
-        "  w_B 则一路单调上升（0.88538 → 2.37523，×2.68），全量幂律拟合的指数 b = {exp_b:.3}（≈1，即 w_B 大致正比于 B/G）；"
+        "  w_B 则随 B/G 上升（{wb_lo:.5} → {wb_hi:.5}，×{:.2}），全量幂律拟合的指数 b = {exp_b:.3}；",
+        wb_hi / wb_lo
     );
-    eprintln!("  即：**蓝通道由白平衡主导，红通道不是单一光滑函数**——B/G 1.33~2.19 之间只有 2 个点，那一带的形状没被约束住。");
+    eprintln!("  以上是原样读数；「陡降还是光滑过渡」由 [5c] 的局部弹性表判定，不在本节下结论。");
+
+    // ---- [5c] 局部弹性：判定「陡降」还是「光滑过渡」 ----
+    eprintln!("\n[5c] 局部弹性 d ln w / d ln(B/G)（幂律的局部指数）——直接回答「陡降还是光滑过渡」");
+    eprintln!("  按**档均值**算相邻档之间（同档多张图先平均，避免除以近零的 Δln x）。");
+    eprintln!(
+        "  {:<22} {:>10} {:>10} {:>10} {:>10}",
+        "相邻档（B/G）", "Δln(B/G)", "R 弹性", "B 弹性", "区间跨度"
+    );
+    let mut level_pts: Vec<(f64, f64, f64)> = Vec::new(); // (bg, w_R, w_B) 档均值
+    for g in &levels {
+        let n = g.len() as f64;
+        let bg = g.iter().map(|&i| images[i].bg).sum::<f64>() / n;
+        let wr = g.iter().map(|&i| images[i].w_norm[0]).sum::<f64>() / n;
+        let wb = g.iter().map(|&i| images[i].w_norm[2]).sum::<f64>() / n;
+        level_pts.push((bg, wr, wb));
+    }
+    let mut er_all: Vec<f64> = Vec::new();
+    let mut eb_all: Vec<f64> = Vec::new();
+    for w in level_pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let dx = (b.0 / a.0).ln();
+        if dx.abs() < 1e-9 {
+            continue;
+        }
+        let er = (b.1 / a.1).ln() / dx;
+        let eb = (b.2 / a.2).ln() / dx;
+        er_all.push(er);
+        eb_all.push(eb);
+        eprintln!(
+            "  {:.4} → {:.4}  {:>10.4} {:>10.3} {:>10.3} {:>9.0}%",
+            a.0,
+            b.0,
+            dx,
+            er,
+            eb,
+            100.0 * (b.0 / a.0 - 1.0)
+        );
+    }
+    let (rmin, rmax) = (
+        er_all.iter().cloned().fold(f64::INFINITY, f64::min),
+        er_all.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+    );
+    let (bmin, bmax) = (
+        eb_all.iter().cloned().fold(f64::INFINITY, f64::min),
+        eb_all.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+    );
+    eprintln!(
+        "\n  R 弹性范围 {rmin:.3} ~ {rmax:.3}（跨度 {:.3}）· B 弹性范围 {bmin:.3} ~ {bmax:.3}（跨度 {:.3}）",
+        rmax - rmin,
+        bmax - bmin
+    );
+    eprintln!("  若某通道的弹性近似常数 → 单一幂律成立（光滑过渡）；若弹性在个别区间远大于其他区间 → 那里是「陡降」。");
     eprintln!(
         "  功能后果：留出档上色度误差 M0 {ba:.5} → 预测 {pa:.5}（{:+.0}%），上限 {ca:.5}（{:+.0}%）",
         100.0 * (pa / ba.max(1e-12) - 1.0),
@@ -1200,11 +1430,13 @@ fn fit_wb_dependent_gain() {
     eprintln!();
     eprintln!("  必须随结论一起说的限制：");
     eprintln!(
-        "  · 参考图场景各异，`w` 是在它们身上解出来的；白平衡只有 {} 档，且最大的一档是同场景连拍——",
+        "  · 参考图场景各异，`w` 是在它们身上解出来的；白平衡有 {} 档，且最大的一档是同场景连拍——",
         levels.len()
     );
     eprintln!("    因此「档内离散」**低估**了跨场景的内容敏感性。");
-    eprintln!("  · 档间有大空档，留一档 CV 主要是在**插值**；真正没见过的白平衡可能更远。");
+    eprintln!("  · **新增的色温扫描是同一场景**：它补的是「B/G 轴上点多不多」，**没有**补「换场景还成不成立」。");
+    eprintln!("    留一档 CV 仍是**相邻档之间的插值**，不是跨场景验证；唯一能看跨场景的是 [1d]。");
+    eprintln!("  · 档内还可能有近邻档（B/G 只差零点几个百分点），那会让留一档 CV 偏乐观——见 [3b]。");
     eprintln!("  · 形式是按 CV 指标逐通道挑的，属于模型选择，CV 数字略偏乐观。");
     eprintln!("  · 色度尺对**逐通道曲线差**不免疫：参考端 NEUTRAL 的逐通道色调曲线会部分落进残差。");
     eprintln!("  · `w` 只有出现在参考集里的白平衡才被观测过；本诊断给的是曲线，不是物理模型。");
@@ -1260,4 +1492,29 @@ fn instrument_recovers_known_gains() {
     let f = fit_form(Form::Const, &pts).expect("应能拟合");
     assert!((f.predict(1.1) - f.predict(3.0)).abs() < 1e-12, "常数形式不应随 x 变化");
     assert!((f.predict(1.1) - 1.4).abs() < 1e-9, "常数形式应给出均值，得到 {}", f.predict(1.1));
+
+    // 分档与选图的两条不变量。注意分档是拿**组首**比，不是拿前一个比。
+    let bgs = [1.000, 1.002, 1.004, 1.5, 3.0];
+    let g = group_by_bg(&bgs, 5e-3);
+    assert_eq!(g.len(), 3, "1.000/1.002/1.004 应合成一档，得到 {g:?}");
+    // 与组首比较，不是与相邻元素比较：1.009 距组首 0.9% 超出容差，于是另起一档
+    let g2 = group_by_bg(&[1.000, 1.006, 1.009], 5e-3);
+    assert_eq!(g2.len(), 2, "分档应与组首比较，得到 {g2:?}");
+
+    let stems = ["DSC_0001", "DSC_0002", "DSC_0003", "DSC_0100", "DSC_0200"];
+    let census: Vec<(String, f64, f64)> = stems
+        .iter()
+        .enumerate()
+        .map(|(i, s)| ((*s).to_string(), 1.0, bgs[i]))
+        .collect();
+    let levels = group_by_bg(&census.iter().map(|c| c.2).collect::<Vec<_>>(), 5e-3);
+    let (chosen, _) = choose_stems(&census, &levels);
+    for g in &levels {
+        let rep = &census[g[0]].0;
+        assert!(chosen.contains(rep), "每档的代表 {rep} 都应在选中列表里：{chosen:?}");
+    }
+    assert!(
+        chosen.contains(&"DSC_0003".to_string()),
+        "多图档应再补一张编号相隔最远的成员（DSC_0003）：{chosen:?}"
+    );
 }

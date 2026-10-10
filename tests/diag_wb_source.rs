@@ -141,6 +141,11 @@ fn cam_mul_matches_nikons_own_wb_levels() {
             eprintln!("       WB_RBLevels 原始 {} 字节：{:02X?}", r.len(), &r[..r.len().min(24)]);
         }
 
+        if let Ok(Some(k)) = makernote::color_temperature(&data) {
+            eprintln!("       色温：{k} K");
+        }
+
+
         // 黑电平：LibRaw 的唯一来源就是 MakerNote tag 0x003d，用同一个解析器读它。
         // 诊断 L 已从源码确证 LibRaw 读的就是这里，且逐通道扣、只扣一次、整数、钳到 0。
         match makernote::black_level(&data) {

@@ -84,6 +84,38 @@ pub fn tag_u16(data: &[u8], tag: u16) -> Result<Option<u16>> {
     }
 }
 
+/// Nikon MakerNote 的 **ColorTemperature**（开尔文）。
+///
+/// # 这个标签解决了一个实际的坑
+///
+/// 判断"画面渲染得暖不暖"时，`cam_mul` 的 `B/G` 是个**反直觉**的指标：它反映的是
+/// **用户设的色温值**，而不是环境光。设 K 越高，相机越"以为"光很蓝、于是给蓝的
+/// 补偿越少，**画面渲染得越暖，而 `B/G` 越小**。
+///
+/// 实测一组色温扫描（`DSC_0561`~`0570`）验证了这条严格单调：
+///
+/// ```text
+/// K  2560 → B/G 3.0156      K  4720 → B/G 1.5254
+/// K  3030 → B/G 2.4609      K  5550 → B/G 1.4941
+/// K  3490 → B/G 2.0195      K  6670 → B/G 1.3535
+/// K  3700 → B/G 2.0059      K  8330 → B/G 1.2695
+/// K  4550 → B/G 1.7324      K 10000 → B/G 1.1836
+/// ```
+///
+/// **零反例。** 所以描述白平衡覆盖时应当用 K，不要用 `B/G` 的大小去暗示冷暖——
+/// 那样会把方向说反（本项目已经踩过一次）。
+pub const TAG_COLOR_TEMPERATURE: u16 = 0x004f;
+
+/// 读出 Nikon MakerNote 记录的色温（开尔文）。
+///
+/// 返回 `None` 表示没有这个标签，或值不在合理范围（1000~40000 K）内。
+pub fn color_temperature(data: &[u8]) -> Result<Option<u16>> {
+    match tag_u16(data, TAG_COLOR_TEMPERATURE)? {
+        Some(k) if (1000..=40000).contains(&k) => Ok(Some(k)),
+        _ => Ok(None),
+    }
+}
+
 /// 读出 Active D-Lighting 档位。
 pub fn active_d_lighting(data: &[u8]) -> Result<Option<ActiveDLighting>> {
     Ok(tag_u16(data, TAG_ACTIVE_D_LIGHTING)?.map(ActiveDLighting::from_raw))
