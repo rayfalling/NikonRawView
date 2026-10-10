@@ -855,6 +855,111 @@ fn real_sample_is_rejected_as_reference_because_adl_is_on() {
     assert!(joined.contains("ADL 未关闭"), "应指出 ADL 问题：{joined}");
 }
 ///
+/// Lead 专项：**相机矩阵是否随场景变化？**
+///
+/// 现有矩阵是从 `DSC_4143` 单张推导的。若它其实随场景变化，那么两张彩色参考图
+/// （`DSC_0141` / `DSC_8562`）失败的最前面那一级就有问题——不必再往拟合环节找。
+///
+/// 判据用「跨图复验残差」而非矩阵本身的差异——两个都准的矩阵可能数值不同（病态
+/// 输入下解不唯一），真正要问的是**一个矩阵能否同时解释另一张图**。
+#[test]
+fn camera_matrix_is_scene_independent() {
+    let dir = samples_dir();
+    let a = dir.join("DSC_4143.NEF");
+    let b = dir.join("DSC_0141.NEF");
+    if !a.is_file() || !b.is_file() {
+        eprintln!("跳过：需要 DSC_4143.NEF 与 DSC_0141.NEF");
+        return;
+    }
+
+    let opts = Options { demosaic: Demosaic::Linear, user_mul: None };
+    let pairs_of = |p: &std::path::Path| -> Vec<([f32; 3], [f32; 3])> {
+        let cam =
+            libraw::decode_with_output_for_test(p, &opts, libraw::OutputColor::Camera).unwrap();
+        let pro =
+            libraw::decode_with_output_for_test(p, &opts, libraw::OutputColor::ProPhoto).unwrap();
+        let mut v = Vec::new();
+        for i in (0..cam.pixels.len()).step_by(3 * 37) {
+            let c = [cam.pixels[i], cam.pixels[i + 1], cam.pixels[i + 2]];
+            let q = [pro.pixels[i], pro.pixels[i + 1], pro.pixels[i + 2]];
+            if c.iter().any(|x| *x == 0 || *x == u16::MAX)
+                || q.iter().any(|x| *x == 0 || *x == u16::MAX)
+            {
+                continue;
+            }
+            let f = |x: [u16; 3]| {
+                [
+                    x[0] as f32 / 65535.0,
+                    x[1] as f32 / 65535.0,
+                    x[2] as f32 / 65535.0,
+                ]
+            };
+            v.push((f(c), f(q)));
+        }
+        v
+    };
+
+    let pa = pairs_of(&a);
+    let pb = pairs_of(&b);
+    eprintln!("DSC_4143 配对 {} 个；DSC_0141 配对 {} 个", pa.len(), pb.len());
+    let ma = nikonrawview::color::derive_matrix(&pa).expect("A 应能求解");
+    let mb = nikonrawview::color::derive_matrix(&pb).expect("B 应能求解");
+
+    eprintln!("\nDSC_4143 推导（rms {:.7}）：", ma.rms);
+    for r in &ma.matrix {
+        eprintln!("    [{:>9.5} {:>9.5} {:>9.5}]", r[0], r[1], r[2]);
+    }
+    eprintln!("DSC_0141 推导（rms {:.7}）：", mb.rms);
+    for r in &mb.matrix {
+        eprintln!("    [{:>9.5} {:>9.5} {:>9.5}]", r[0], r[1], r[2]);
+    }
+    let diff: f32 = (0..3)
+        .flat_map(|i| (0..3).map(move |j| (i, j)))
+        .map(|(i, j)| (ma.matrix[i][j] - mb.matrix[i][j]).abs())
+        .sum();
+    eprintln!("\n两个矩阵的差异和 = {diff:.5}");
+
+    let cross = |m: nikonrawview::mat3::Mat3, pairs: &[([f32; 3], [f32; 3])]| -> (f64, f64) {
+        let mut s = 0f64;
+        let mut w = 0f64;
+        let mut n = 0u64;
+        for (c, t) in pairs {
+            let p = nikonrawview::mat3::mul_vec(m, *c);
+            for k in 0..3 {
+                let e = (p[k] - t[k]).abs() as f64;
+                s += e;
+                w = w.max(e);
+                n += 1;
+            }
+        }
+        (s / n as f64, w)
+    };
+    let (aa, aa_w) = cross(ma.matrix, &pa);
+    let (ab, ab_w) = cross(ma.matrix, &pb);
+    let (bb, bb_w) = cross(mb.matrix, &pb);
+    let (ba, ba_w) = cross(mb.matrix, &pa);
+    eprintln!("\n交叉验证（平均绝对差 / 最大）：");
+    eprintln!("  A 的矩阵 → A 的图：{aa:.7} / {aa_w:.7}   （同图）");
+    eprintln!("  A 的矩阵 → B 的图：{ab:.7} / {ab_w:.7}   ← 关键");
+    eprintln!("  B 的矩阵 → B 的图：{bb:.7} / {bb_w:.7}   （同图）");
+    eprintln!("  B 的矩阵 → A 的图：{ba:.7} / {ba_w:.7}");
+
+    let ratio = ab / aa.max(1e-12);
+    eprintln!("\n跨图残差与同图残差之比 = {ratio:.2}×");
+    if ratio < 3.0 {
+        eprintln!("判定：**矩阵与场景无关**——一个矩阵可同时解释两张场景差异很大的图。");
+        eprintln!("      因此彩色图上的色度问题不在相机矩阵这一级。");
+    } else {
+        eprintln!("判定：**矩阵随场景变化**——同一个矩阵无法解释另一张图，");
+        eprintln!("      彩色图失败的根因可能在最前面的色彩转换环节。");
+    }
+
+    assert!(
+        ratio < 3.0,
+        "相机矩阵疑似随场景变化（跨图残差是同图的 {ratio:.2} 倍）——这是比拟合更靠前的根因"
+    );
+}
+
 /// 前提来自 3.1 的实测——矩阵按机型固定、不随拍摄白平衡变化，所以每个机型只需测一次。
 /// 若本测试通过，`render/color-pipeline` 就可以保留「由本管线施加矩阵」，同时拿回
 /// 色域裁切与负值的控制权。
