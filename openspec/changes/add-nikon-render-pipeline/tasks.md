@@ -37,8 +37,8 @@
 ## 5. 标定（capability `picture-control/calibration`）
 
 - [x] 5.1 实现参考导出清单与校验工具（`src/calibrate.rs`）：清单为制表符分隔的文本（`原始\t导出`，`#` 注释），读写均已实现且**中文路径原样往返**；逐对校验四项前提——**ADL 是否关闭**（新增 `makernote::active_d_life_lighting`，走 MakerNote tag `0x0022`）、**Picture Control 是否为指定基准**（复用已有的配方身份解析，同时校验名称与基准色彩）、**参考导出有无额外调整**（从内嵌 XMP 的 `crs:`/`crd:` 属性中提取，18 项须为中性的调整项；刻意不列入 `CameraProfile`/`Temperature`/`Tint`/`ProcessVersion`，它们非零是正常的）、**与配对 NEF 是否同源**（以有效像素尺寸为证）。任一项不满足即**排除该对并报告原因**，不降权继续用。**真实数据验证**：对 `DSC_4143.NEF` 运行，正确报出三条拒绝理由（ADL 为「标准」、PC 为 `LINKS-Nature` 而非 `NEUTRAL`、导出无 XMP）。另修掉一个会在真实 XMP 上崩溃的 bug——扫描器原按字节下标切 `&str`，遇到 NX Studio XMP 的 BOM（U+FEFF）即 panic，已改为全程在字节上操作并加回归测试
-- [ ] 5.2 **【需要你手工执行】** 按清单用 NX Studio 从 `simple/` 的 NEF 及若干张行程照片重导参考样张（PC=NEUTRAL、ADL 关闭、无其他调整）；验证清单中每条都有对应文件，缺失者被报告
-- [ ] 5.3 实现按参考导出内嵌 ICC 转换到线性；验证使用 `Nikon sRGB 4.0.0.3002` 时结果与当成 sRGB 处理**不同**（锁死"必须尊重 ICC"这条），并在缺少 ICC 时明确报告与标注假定
+- [x] 5.2 **【由用户手工执行】** 已导出 15 张参考样张（NX Studio，**自然 / NEUTRAL + ADL 关闭**），源图取自 `E:\Nikon\Z8\2026.9.29-10.7 瑞士+罗马`，与 `NKSC_PARAM` 边车一并复制到 `simple/`，与 15 张 `.TIF` 按文件名 1:1 配对齐全。**过程中发现一条关键事实**：相机把拍摄时的 Picture Control / ADL 写进 NEF 的 MakerNote，而 NX Studio 的修改存在 `NKSC_PARAM\<名>.nksc` 里、导出时**边车覆盖内嵌值**——因此 NEF 内嵌设置对这批文件是过期的（记着 `LINKS-Nature` + ADL 标准），校验必须以边车为准。`.nksc` 本身是 XMP（`sdc:`/`ast:` 命名空间 + base64 包裹的 XMP 包），**不是** NP3 容器
+- [x] 5.3 实现按参考导出内嵌 ICC 转换到线性（`src/icc.rs`）：解析矩阵/TRC 型 ICC（`desc`/`wtpt`/`rXYZ`/`gXYZ`/`bXYZ`/`rTRC`/`gTRC`/`bTRC`），线性化后经色料矩阵到 PCS XYZ，再转 ProPhoto 线性。**实测结论修正了本任务原先的预期**：内嵌的 `Nikon sRGB 4.0.0.3002` **就是**标准 sRGB——色料矩阵与 sRGB 相同，4096 点采样曲线与 sRGB 解析式之差仅 **1.478e-5**，而 16 位量化步长是 1.526e-5，差异完全来自量化。因此"与当成 sRGB 处理结果不同"**对这组样本不成立**。改为用一条合成 profile（gamma 1.8）锁死「必须读文件里的曲线」：本实现得 0.287019，gamma 1.8 期望 0.287175，而 sRGB 为 0.214041——若实现退回 sRGB 假定，两者不可能同时成立。另实现了缺 ICC 时的**显式假定**：`ColorSpacePlan::AssumedSrgb` 把「假定」写成可读说明并带进报告，不静默按 sRGB 处理；非矩阵型（LUT）profile 明确报错而非退回 sRGB
 - [ ] 5.4 实现拟合：由（线性 RGB, 参考输出）配对拟合出「一维色调曲线 + 三维色彩查找表」，产出可复用数据文件
 - [ ] 5.5 实现质量报告：输出 ΔE00 的中位数、P95 与误差最大的若干样本；验证目标为「中位数 ≤ 1.0 且 P95 ≤ 3.0」，未达标时明确报告未达标而非静默接受
 - [ ] 5.6 把样本划分为拟合集与验证集，验证报告中区分两者的 ΔE，避免过拟合被掩盖

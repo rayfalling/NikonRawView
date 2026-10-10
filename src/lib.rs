@@ -16,6 +16,7 @@ pub mod calibrate;
 pub mod camera;
 pub mod color;
 pub mod error;
+pub mod icc;
 pub mod library;
 pub mod libraw;
 pub mod makernote;
