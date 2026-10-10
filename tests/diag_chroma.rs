@@ -52,8 +52,8 @@ fn chroma_accuracy_and_sample_adequacy() {
     eprintln!("尺寸 {}×{}", fx.size.0, fx.size.1);
 
     // ---------- 一、这张图够不够格当色度验证样本 ----------
-    let mut ref_c: Vec<f64> = fx.eval.iter().map(|s| chroma(lab(s.theirs_linear))).collect();
-    let mut ours_c: Vec<f64> = fx.eval.iter().map(|s| chroma(lab(s.ours_linear))).collect();
+    let ref_c: Vec<f64> = fx.eval.iter().map(|s| chroma(lab(s.theirs_linear))).collect();
+    let ours_c: Vec<f64> = fx.eval.iter().map(|s| chroma(lab(s.ours_linear))).collect();
     let ref_med = median(&mut ref_c.clone());
     let ours_med = median(&mut ours_c.clone());
     let colored = ref_c.iter().filter(|c| **c > 10.0).count();
@@ -110,7 +110,7 @@ fn chroma_accuracy_and_sample_adequacy() {
     eprintln!("  |ΔL'/SL| = {dl_med:.3}    |ΔC'/SC| = {dc_med:.3}");
 
     // 色度只在高彩度区才有意义——单独看有色像素的色度误差
-    let mut colored_dc: Vec<f64> = fx
+    let colored_dc: Vec<f64> = fx
         .eval
         .iter()
         .filter(|s| chroma(lab(s.theirs_linear)) > 10.0)
