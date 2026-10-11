@@ -298,6 +298,97 @@ pub fn decode_srgb(x: f32) -> f32 {
 /// 曲线的定义域与值域都是 0..1 的**编码值**，而管线其余部分走线性，因此这里必须做
 /// 两次转换。少了任何一次，曲线都会作用在错误的定义域上——而那种错误不会报错，
 /// 只会让画面整体偏亮或偏暗。
+/// 逐通道拟合一维色调曲线：**三通道各自一条**。
+///
+/// # 为什么需要它
+///
+/// 两条独立诊断指向同一件事：
+///
+/// 1. **诊断 D（尺度不变色度比对）**：三条独立单调曲线能把通道比值差全部吃掉——
+///    `DSC_0141` 的 `B/G` 从 `×0.7007` 回到 `×0.9951`。瓶颈是"一条共享曲线给不了
+///    逐通道增益"。
+/// 2. **诊断 N（跨图迁移惩罚归因）**：跨图时多出来的误差里，**3 条逐通道曲线吃掉
+///    96.6%**，而 1 条共享曲线只有 **18.6%**、矩阵前的 3 参数增益只有 10.4%；
+///    同时排除了覆盖问题（无支撑质量中位 0.01%）与网格分辨率问题（33³ 更差）。
+///
+/// ⇒ **惩罚的形状是「变换输出端、逐通道的色调/尺度差」。**
+///
+/// 注意诊断 N 的那 96.6% 是**神谕**（用留出图自己的参考值拟合），量的是形状不是
+/// 可达增益。所以本函数是给"验证端到端是否兑现"用的，**不要在验证之前就据此改
+/// `BaseTransform` 的格式**。
+///
+/// 返回三条曲线，每条 `bins + 1` 个采样点，定义域与值域都是 0..1 的**编码值**。
+pub fn fit_curves_per_channel(samples: &[Sample], bins: usize) -> [Vec<f32>; 3] {
+    let bins = bins.max(2);
+    let mut out: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (k, slot) in out.iter_mut().enumerate() {
+        let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); bins];
+        for s in samples {
+            let x = encode_srgb(s.ours[k]);
+            let b = ((x * bins as f32) as usize).min(bins - 1);
+            buckets[b].push(encode_srgb(s.theirs[k]));
+        }
+        *slot = curve_from_buckets(&mut buckets, bins);
+    }
+    out
+}
+
+/// 逐通道曲线的前向施加：**编码 → 各查各的曲线 → 解码**。
+pub fn forward_curves(curves: &[Vec<f32>; 3], v: [f32; 3]) -> [f32; 3] {
+    let mut out = v;
+    for (k, c) in curves.iter().enumerate() {
+        if c.len() >= 2 {
+            out[k] = decode_srgb(apply_curve(c, encode_srgb(v[k])));
+        }
+    }
+    out
+}
+
+/// 由分箱中位数构造一条单调不减的曲线（空箱线性内插）。
+fn curve_from_buckets(buckets: &mut [Vec<f32>], bins: usize) -> Vec<f32> {
+    let mut med: Vec<Option<f32>> = buckets
+        .iter_mut()
+        .map(|v| {
+            if v.is_empty() {
+                return None;
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            Some(v[v.len() / 2])
+        })
+        .collect();
+
+    let known: Vec<usize> = (0..bins).filter(|i| med[*i].is_some()).collect();
+    if known.is_empty() {
+        return (0..=bins).map(|i| i as f32 / bins as f32).collect();
+    }
+    for i in 0..bins {
+        if med[i].is_some() {
+            continue;
+        }
+        let lo = known.iter().rev().find(|k| **k < i).copied();
+        let hi = known.iter().find(|k| **k > i).copied();
+        med[i] = match (lo, hi) {
+            (Some(l), Some(h)) => {
+                let f = (i - l) as f32 / (h - l) as f32;
+                Some(med[l].unwrap() * (1.0 - f) + med[h].unwrap() * f)
+            }
+            (Some(l), None) => med[l],
+            (None, Some(h)) => med[h],
+            (None, None) => Some(i as f32 / bins as f32),
+        };
+    }
+
+    let mut out: Vec<f32> = (0..=bins)
+        .map(|i| if i == bins { med[bins - 1].unwrap() } else { med[i].unwrap() })
+        .collect();
+    for i in 1..out.len() {
+        if out[i] < out[i - 1] {
+            out[i] = out[i - 1];
+        }
+    }
+    out
+}
+
 pub fn forward_curve(curve: &[f32], v: [f32; 3]) -> [f32; 3] {
     if curve.len() < 2 {
         return v;
