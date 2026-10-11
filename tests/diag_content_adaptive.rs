@@ -11,50 +11,56 @@
 //! - **B. 我们的解码有逐图误差** —— 那么"需要的修正"与任何内容统计量都**无关**
 //!   （随机项或尚未识别的隐藏参数）。B 是零假设。
 //!
-//! # 协议：修正必须定义在"跨图基座"之上
+//! # 协议：修正必须定义在"跨图基座"之上，而且要先量清"哪种参数化才有 headroom"
 //!
-//! 第一版把"需要的修正"定义成"从我们解码直接到参考"的曲线，结果五条臂不可比：
+//! 第一版把"需要的修正"定义成"从我们解码直接到参考"的曲线，结果各臂不可比：
 //! 那个口径下"修正"要独自承担整条色调映射，一个 6 参数模型当然打不过标定集
-//! 拟合出来的 129 点曲线。**所以本版把口径改成残差**：
+//! 拟合出来的 129 点曲线。**所以本版把口径改成残差，并对三种参数化并列测量**：
 //!
 //! ```text
 //! 跨图基座 T_i ：只在**标定集**（其余图的左半）上拟合的「共享曲线 + 17³ LUT」
-//! 需要的修正 y ：把 T_i 的输出映射到参考所需的**残差修正**（6 参数）
+//! 需要的修正 y ：把 T_i 的输出映射到参考所需的**残差修正**，三种表示各测一rip
+//!                · 6 参数：编码域逐通道曲线在 0.5 处的偏离（mid）+（0.75−0.25）的斜率差
+//!                · 3 参数：逐通道对角增益 log2 g
+//!                · 完整：129 点逐通道曲线（只作神谕上界，用来量参数化的天花板）
 //! ```
 //!
-//! 于是"五条臂"共用**同一个** `T_i`，差别只在给它加什么残差修正——这才是可控对照。
-//! `T_i` 是用标定集拟合的，所以它对应 Lead 那份"跨图不兑现"的现状；而"无修正"臂
-//! 的 ΔE00 就是那个现状的水平。
+//! 所有臂共用**同一个** `T_i`，差别只在给它加什么残差修正——这才是可控对照。
+//! `T_i` 是用标定集拟合的，所以它对应 Lead 那份"跨图不兑现"的现状；"无修正"臂的
+//! ΔE00 就是那个现状的水平。
 //!
 //! # 做法（四步，第 4 步是唯一裁判）
 //!
 //! 1. **把"需要的修正"压成标量。** 对每张图 `j`、每个留出图 `i`：在 `j` 的**左半**
-//!    上把 `T_i(o)` 映射到参考，用 `fit_curves_per_channel` 拟 3 条逐通道曲线，
-//!    取编码域 `x = 0.5` 处的偏离（`mid_c`）与 `0.75 − 0.25` 处的斜率差（`slope_c`），
-//!    得到 6 个参数；另附 3 个残差对角增益 `log2 g_c` 作对照。理由：诊断 N 把跨图
-//!    惩罚的 96.6% 归到「输出端、逐通道的色调/尺度差」，`mid/slope` 正是它的水平与
-//!    斜率；增益则是最省的自由度，用来检查"是不是只要一个尺度就够"。
+//!    上把 `T_i(o)` 映射到参考，用 `fit_curves_per_channel` 拟 3 条逐通道曲线，再取
+//!    编码域 `x = 0.5` 的偏离与 `0.75 − 0.25` 的斜率差（6 参数）与残差对角增益（3 个
+//!    `log2 g`）。理由：诊断 N 把跨图惩罚的 96.6% 归到「输出端、逐通道的色调/尺度差」，
+//!    `mid/slope` 是它的水平与斜率、增益是最省的自由度。
 //!    **每张图报的 `y_i` 取 `T_i`（没见过这张图的基座）下的值。**
 //! 2. **量内容统计量。** 17 个，全部**只从我们自己的解码算**（运行时可获得）——
 //!    参考图上的统计量在生产里拿不到，用它做预测等于作弊。
 //! 3. **相关矩阵。** 13 个修正标量 × 17 个统计量 = 221 个候选对。把已有的两个
 //!    自变量 `cam_mul` 的 `R/G`、`B/G`（以及色温 K）放进同一张表作**对照**：
 //!    只有某个内容统计量**明显强于**它们，才算找到第三个自变量。
-//! 4. **留一图验证。** 五条臂共用 `T_i`，只在残差修正上不同：
+//! 4. **留一图验证（十条臂）。** 关键是顺序：**先问这条路的 headroom 有多大**
+//!    （各"神谕"臂 = 用留出图自己左半解出的修正），**再问内容预测吃到了多少**
+//!    （内容臂 vs 同表示的"平均"臂）。若神谕都改善不了，那"内容能不能预测"这个问题
+//!    本身就是空的——不能拿一个无用的量去要求预测。
 //!
-//!    | 臂 | 残差修正怎么来 | 它回答什么 |
+//!    | 臂 | 修正怎么来 | 它回答什么 |
 //!    |---|---|---|
 //!    | 无修正 | 不加 | 现状（跨图不兑现的水平） |
-//!    | 平均修正 | 标定集各图 `y_j` 的**均值** | "用标定集平均"这个基线 |
-//!    | 内容（嵌套） | 每个参数在**标定集内**选 \|r\| 最大的统计量 + 一元 OLS | 诚实的可达增益 |
-//!    | 内容（偷看） | 统计量用**全部图**（含留出图）选 | 乐观上界，量化选择偏差 |
-//!    | 神谕 | 留出图自己的 `y_i`（用它左半解出） | 完美预测的上限（headroom） |
+//!    | 平均(6参/增益) | 标定集各图 `y_j` 的均值 | "用标定集平均"这个基线 |
+//!    | 内容(嵌套) | 每个参数在**标定集内**选 \|r\| 最大的统计量 + 一元 OLS | 诚实的可达增益 |
+//!    | 内容(偷看) | 统计量用**全部图**（含留出图）选 | 乐观上界，量化选择偏差 |
+//!    | 神谕(6参/增益/完整曲线) | 留出图自己的修正（用它左半解出） | 各参数化的 headroom 上界 |
 //!
 //! # 纪律
 //!
 //! **相关性 ≠ 可达增益。** 本项目已因"结论说得比证据满"返工三次（最近一次就是
 //! 诊断 N 的神谕 96.6% vs 实际 −1.2%）。所以：报告候选对数量、给出 Bonferroni
-//! 校正后的显著性门槛、并**以第 4 步的留一图结果为准**下判定。
+//! 校正后的显著性门槛、并**以第 4 步的留一图结果为准**下判定。只做到第 3 步的结论
+//! 必须标注"这是相关性，未验证可达性"。
 //!
 //! 另有两条不依赖相关系数的证据：
 //!
@@ -217,8 +223,8 @@ fn pearson(xs: &[f64], ys: &[f64]) -> f64 {
 
 /// 一元 OLS 预测：`ŷ = ȳ + r·(s_y/s_x)·(x − x̄)`。
 ///
-/// 用这个写法而不是 `a + b·x`，是因为 `|r|` 小时它会**自动收缩到均值**——
-/// 不会因为选中的统计量其实没用就给出一个乱跳的预测（那会把基线衬托得虚高）。
+/// 用这个写法而不是 `a + b·x`，是因为 `|r|` 小时它会**自动收缩到均值**。
+/// 但收缩不足以挡住外推失控，所以外层用 [`ols_predict_clamped`]。
 fn ols_predict(xs: &[f64], ys: &[f64], x: f64) -> f64 {
     let pairs = finite_pairs(xs, ys);
     if pairs.len() < 3 {
@@ -236,6 +242,24 @@ fn ols_predict(xs: &[f64], ys: &[f64], x: f64) -> f64 {
         return my;
     }
     my + (sxy / sxx) * (x - mx)
+}
+
+/// 一元 OLS 预测，**结果夹在标定集 `y` 的取值范围内**。
+///
+/// # 为什么必须夹
+///
+/// 不夹时实测会失控：`高光占比>0.9` 这类几乎恒为 0（跨度 ~1e-4）的统计量一旦被选中，
+/// 斜率会随 x 的微小差异爆炸，`DSC_8562` 的 ΔE00 从 9.7 直接跳到 65——那不是"内容
+/// 预测不行"，是数值失控，会把整条臂的成绩毁掉、也可能把结论带偏。夹住之后每个参数
+/// 都落在标定集见过的范围内，比较才是公平的（这就是"不外推"这条常规纪律）。
+fn ols_predict_clamped(xs: &[f64], ys: &[f64], x: f64) -> f64 {
+    let pairs = finite_pairs(xs, ys);
+    if pairs.len() < 3 {
+        return mean_of(&pairs.iter().map(|p| p.1).collect::<Vec<_>>());
+    }
+    let lo = pairs.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let hi = pairs.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    ols_predict(xs, ys, x).clamp(lo, hi)
 }
 
 /// Pearson `|r|` 的双侧临界值表（`df = n − 2`，下标 0 对应 `df = 1`）。
@@ -680,7 +704,7 @@ fn predict_vec(
         };
         let xs: Vec<f64> = fit_set.iter().map(|&i| images[i].stats[stat]).collect();
         let yy: Vec<f64> = fit_set.iter().map(|&i| ys[i][k]).collect();
-        out[k] = ols_predict(&xs, &yy, images[target].stats[stat]);
+        out[k] = ols_predict_clamped(&xs, &yy, images[target].stats[stat]);
         picks.push(stat);
     }
     (out, picks)
@@ -1048,6 +1072,8 @@ fn needed_correction_versus_image_content() {
     let mut avg: Vec<Vec<f64>> = vec![Vec::new(); n_arm];
     let mut errs: Vec<Vec<f64>> = vec![Vec::new(); n_arm];
     let mut picks: Vec<Vec<String>> = vec![Vec::new(); n_arm];
+    // 每张图的左半（训练侧）：`(无修正, 6参神谕, 完整曲线神谕)` 的 ΔE00 中位。
+    let mut left_side: Vec<(f64, f64, f64)> = Vec::with_capacity(n);
 
     for hole in 0..n {
         let cal: Vec<usize> = (0..n).filter(|j| *j != hole).collect();
@@ -1120,6 +1146,35 @@ fn needed_correction_versus_image_content() {
         let fc = &full[hole];
         push(A_ORACLEFULL, eval(&|x| fit::forward_curves(fc, x)), f64::NAN);
 
+        // 同一张图的**左半（训练）**上，神谕修正兑现得怎样？
+        // 这是"需要的修正到底是不是一个全局每图对象"的直接检验：若左半大幅改善而右半不改善，
+        // 那它就不是每图一个的函数，而是**逐区域**的——那样任何"每图一个修正"的方案都注定失败。
+        {
+            let stride = 4;
+            let lt: Vec<[f32; 3]> =
+                images[hole].left.iter().step_by(stride).map(|r| r.t).collect();
+            let lo: Vec<[f32; 3]> = images[hole]
+                .left
+                .iter()
+                .step_by(stride)
+                .map(|r| base.apply(r.o))
+                .collect();
+            let med_of = |f: &dyn Fn([f32; 3]) -> [f32; 3]| -> f64 {
+                let mut v: Vec<f64> = lo
+                    .iter()
+                    .zip(lt.iter())
+                    .map(|(x, t)| deltae::delta_e_prophoto(f(*x), *t))
+                    .collect();
+                median_of(&mut v)
+            };
+            let o6 = oracle6.curves();
+            left_side.push((
+                med_of(&|x| x),
+                med_of(&|x| fit::forward_curves(&o6, x)),
+                med_of(&|x| fit::forward_curves(fc, x)),
+            ));
+        }
+
         eprintln!(
             "  留出 {:<10} 无修正 {:.3} | 6参: 平均 {:.3} 嵌套 {:.3} 偷看 {:.3} 神谕 {:.3} | \
              增益: 平均 {:.3} 嵌套 {:.3} 偷看 {:.3} 神谕 {:.3} | 完整曲线神谕 {:.3}",
@@ -1182,7 +1237,34 @@ fn needed_correction_versus_image_content() {
         );
     }
 
+    // ---------- 五、神谕修正的左半(训练) vs 右半(留出) ----------
+    eprintln!("\n【五、神谕修正能不能在同一张图的另一半上兑现？（ΔE00 中位）】");
+    eprintln!("  {:<11} {:>26} {:>26}", "图", "左半（训练侧）", "右半（留出侧）");
+    for hole in 0..n {
+        let (lb, l6, lf) = left_side[hole];
+        eprintln!(
+            "  {:<11} {:>26} {:>26}",
+            images[hole].stem,
+            format!("{lb:.3} → {l6:.3} → {lf:.3}"),
+            format!(
+                "{:.3} → {:.3} → {:.3}",
+                med[A_NONE][hole], med[A_ORACLE6][hole], med[A_ORACLEFULL][hole]
+            )
+        );
+    }
+    let train6 = mean_of(&left_side.iter().map(|(b, o, _)| b - o).collect::<Vec<_>>());
+    let trainfull = mean_of(&left_side.iter().map(|(b, _, f)| b - f).collect::<Vec<_>>());
+    eprintln!(
+        "  均值改善：左半（训练）6 参 {:+.3} / 完整曲线 {:+.3}；\
+         右半（留出）6 参 {:+.3} / 完整曲线 {:+.3}",
+        train6,
+        trainfull,
+        baseline - mean_of(&med[A_ORACLE6]),
+        baseline - mean_of(&med[A_ORACLEFULL])
+    );
+
     // ---------- 判定 ----------
+    // 三步，顺序不能换：先问这条路有没有 headroom，再问内容预测吃到了多少，最后看相关性的门槛。
     let best_content_r = best_content.map(|b| b.2.abs()).unwrap_or(f64::NAN);
     let room6 = baseline - mean_of(&med[A_ORACLE6]);
     let roomg = baseline - mean_of(&med[A_ORACLEG]);
@@ -1199,7 +1281,7 @@ fn needed_correction_versus_image_content() {
         room6, roomg, roomfull
     );
     eprintln!(
-        "  ② 内容预测相对「标定集平均」的改善：6 参数 {:+.3}（赢 {wins6}/{n} 张），\
+        "  ② 内容预测相对「标定集平均」吃到多少：6 参数 {:+.3}（赢 {wins6}/{n} 张），\
          3 参数增益 {:+.3}（赢 {winsg}/{n} 张）；门槛 {:+.2}",
         gain6, gaing, MIN_GAIN
     );
@@ -1210,36 +1292,33 @@ fn needed_correction_versus_image_content() {
         rc_bonf
     );
 
-    // 判定逻辑：先看这条路有没有 headroom，再看内容能不能预测它。
-    if roomfull <= MIN_GAIN && room6 <= MIN_GAIN && roomg <= MIN_GAIN {
+    let passes_gate = best_content_r.is_finite() && best_content_r >= rc_bonf;
+    let captures = (roomg > MIN_GAIN && gaing > MIN_GAIN) || (room6 > MIN_GAIN && gain6 > MIN_GAIN);
+    if passes_gate && captures {
         eprintln!(
-            "  ⇒ **A 不成立，而且这条路的 headroom 本身接近零**：三种参数化的神谕修正都改善不了\
-             （{:+.3} / {:+.3} / {:+.3}）。在现行基座之上，「每张图再补一个残差修正」不是一个有用的自由度——\
-             既然需要的修正几乎为零，问「它是否与内容相关」就没有意义。",
-            room6, roomg, roomfull
+            "  ⇒ **A 成立**：存在过校正门槛的强相关统计量，且在有 headroom 的表示上兑现。"
         );
-    } else if gain6 > MIN_GAIN || gaing > MIN_GAIN {
+    } else if roomg > MIN_GAIN || room6 > MIN_GAIN || roomfull > MIN_GAIN {
         eprintln!(
-            "  ⇒ **A 未获支持**：留一图有一点改善（6 参 {:+.3} / 增益 {:+.3}）但幅度在噪声量级，\
-             且最强相关过不了多重比较校正门槛。不足以支撑「内容自适应」这个结论。",
-            gain6, gaing
+            "  ⇒ **A 不成立**：这条路上**确实有 headroom**（神谕 {room6:+.3} / {roomg:+.3} / {roomfull:+.3}，\
+             即「每张图各补一个修正」是真能改善的），但**内容预测吃不掉它**——相对标定集平均只有 \
+             {gain6:+.3}（6 参）/ {gaing:+.3}（增益）；最强相关 {best_content_r:.3} 也\
+             {}。⇒ 需要的修正与这 {NSTAT} 个统计量无关，应转向 B：找一个还没被识别的逐图参数。",
+            if passes_gate { "过了校正门槛但没兑现" } else { "没过 Bonferroni 校正门槛" }
         );
     } else {
         eprintln!(
-            "  ⇒ **A 不成立（至少这个形式不成立）**：内容预测在留一图上不比「标定集平均」更好\
-             （6 参 {:+.3} / 增益 {:+.3}），没有任何内容统计量与修正强相关 ⇒ 需要的修正与画面内容无关，\
-             转向 B：找一个还没被识别的逐图参数。",
-            gain6, gaing
+            "  ⇒ **A 不成立，而且这条路的 headroom 接近零**：三种参数化的神谕修正都改善不了\
+             （{room6:+.3} / {roomg:+.3} / {roomfull:+.3}）。在现行基座之上，「每张图再补一个修正」\
+             不是一个有用的自由度——既然需要的修正几乎为零，问「它是否与内容相关」就没有意义。"
         );
     }
-    if roomfull > MIN_GAIN && room6 <= MIN_GAIN {
-        eprintln!(
-            "  另注：**完整曲线**的神谕有 headroom（{:+.3}）而 6 参数/增益没有 ⇒ 需要的修正确实存在，\
-             但它是「整条曲线」的形状，用中点与两端的少数标量概括不掉。本诊断的标量相关分析因此只覆盖了\
-             这个修正的一个低维投影，**不能据此否定「A 的其它形式」**。",
-            roomfull
-        );
-    }
+    eprintln!(
+        "  边界：6 参数（编码域中点 + 两端的斜率）**概括不掉**需要的修正（神谕 {room6:+.3}，\
+         比不加还差）；有 headroom 的是完整逐通道曲线（{roomfull:+.3}）与 3 参数增益（{roomg:+.3}）。\
+         本诊断直接测了增益表示、以及完整曲线的低维投影；**没有**直接测「内容能不能预测整条曲线」\
+         （n={n} 不足以验证一个 129 点对象）。"
+    );
     eprintln!(
         "\n限制：n={n}；同内容组 {} 组（色温扫描 3 张 + 42 秒连拍 2 张）；\
          内容统计量只覆盖亮度/色度分布这类一阶量，「画面结构」只在内容签名里用到，未进入相关分析。",
