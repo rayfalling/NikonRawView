@@ -27,6 +27,63 @@ pub struct ColorPlan {
     scale: f32,
     /// 解码层报告的白电平（原始域），仅用于报告与自检。
     color_maximum: i32,
+    /// **矩阵之前**施加的逐通道增益，默认全 1（即不施加）。
+    ///
+    /// 见 [`wb_adaptation`]——这是尼康渲染与 LibRaw 之间唯一剩下的系统性差异。
+    wb_gain: [f32; 3],
+}
+
+/// 尼康渲染的**随白平衡变化的逐通道增益** `w`。
+///
+/// # 这是什么
+///
+/// 诊断链把整条管线逐环排除之后，唯一剩下的系统性差异就是这一层：
+/// 尼康在色彩转换里做了一层**随光源变化的逐通道适配**，而 LibRaw 的
+/// `cam_xyz_coeff` 按源码确认**完全不读白平衡**（`utils_dcraw.cpp:282-313`）。
+///
+/// 实测形态是 `M0·diag(w)`：三参数的对角增益就能吃掉色度落差的 106%，
+/// 而九参数的无约束 3×3 在留出集上反而更差——**所以差的形态是对角增益，
+/// 不是矩阵形状**。
+///
+/// # 系数怎么来的
+///
+/// 从 18 张参考图（17 个白平衡状态、色温覆盖 2500K→10000K）逐图闭式解出 `w`
+/// 再拟合。**自变量必须是 `(R/G, B/G)` 两个**：
+///
+/// - 色温与调色偏移（A/M 微调）沿这个平面上**两个不同方向**移动；
+/// - 只看 `B/G` 等于把两个方向投影到一根轴上——实测同一 `B/G` 下 `R/G` 可差 21%，
+///   而 `w_R` 会因此差 23.9%。
+///
+/// 偏相关是判定依据（不是拟合优度）：
+///
+/// ```text
+/// 通道   r(lnw,lnR/G)  r(lnw,lnB/G)   偏相关(控 lnB/G)   偏相关(控 lnR/G)
+///  R        +0.988        -0.919          +0.918            +0.061
+///  B        -0.872        +0.986          +0.806            +0.979
+/// ```
+///
+/// `w_R` 只跟 `R/G` 走（控制 `R/G` 后 `B/G` 的偏相关塌到 ≈0，且**加 `B/G` 并不
+/// 改善**，所以不是"多参数硬拟合"）；`w_B` 两个都要（二元把最坏误差从 11.39%
+/// 压到 8.33%）。
+///
+/// # 质量与限制
+///
+/// 留一状态交叉验证：`w_R` 中位 2.90% / 最坏 9.41%，`w_B` 中位 2.21% / 最坏 8.33%。
+/// 功能上吃掉留出色度误差 95% 的可改善量（0.54522 → 0.22804，上限 0.21326）。
+///
+/// **限制**：17 个状态但只有两类场景，**跨场景这一维没有被验证**；`DSC_0141`
+/// 在两个通道上都是最坏状态（自动白平衡、在扫描组之外），提示可能还有第三个
+/// 自变量。所以这层是个**经验修正**，不是原理推导——用它的人应当知道这一点。
+///
+/// 两个比值都可从 `cam_mul` 直接算（`R/G = cam_mul[0]/cam_mul[1]`、
+/// `B/G = cam_mul[2]/cam_mul[1]`），渲染时零额外依赖。
+pub fn wb_adaptation(rg: f64, bg: f64) -> [f64; 3] {
+    if !rg.is_finite() || !bg.is_finite() || rg <= 0.0 || bg <= 0.0 {
+        return [1.0, 1.0, 1.0];
+    }
+    let w_r = 0.5187 * rg.powf(0.848);
+    let w_b = 0.5595 * rg.powf(0.441) * bg.powf(1.284);
+    [w_r, 1.0, w_b]
 }
 
 /// 解码层输出的位深满量程。
@@ -58,6 +115,7 @@ impl ColorPlan {
             matrix: d.rgb_cam,
             scale: 1.0 / OUTPUT_FULL_SCALE,
             color_maximum: d.color_maximum,
+        wb_gain: [            1.0,            1.0,            1.0,        ],
         })
     }
 
@@ -67,7 +125,12 @@ impl ColorPlan {
     /// 接口返回的矩阵与输出色彩空间无关、并非实际参与转换的那个；这条用的是自己
     /// 测出来的矩阵。
     pub fn from_derived(matrix: Mat3, full_scale: f32) -> Self {
-        Self { matrix, scale: 1.0 / full_scale, color_maximum: full_scale as i32 }
+        Self {
+            matrix,
+            scale: 1.0 / full_scale,
+            color_maximum: full_scale as i32,
+            wb_gain: [1.0, 1.0, 1.0],
+        }
     }
 
     /// 矩阵本身，供结果记录与手工复核。
@@ -108,7 +171,27 @@ impl ColorPlan {
 
     /// 对 0..1 的相机线性值施加矩阵。
     pub fn apply(&self, cam: [f32; 3]) -> [f32; 3] {
-        mat3::mul_vec(self.matrix, cam)
+        let g = self.wb_gain;
+        // 增益加在**矩阵之前**——这正是 LibRaw 里 scale_colors 的位置，
+        // 也是实测认定该修正所属的那一级。
+        mat3::mul_vec(self.matrix, [cam[0] * g[0], cam[1] * g[1], cam[2] * g[2]])
+    }
+
+    /// 开启随白平衡变化的逐通道增益（见 [wb_adaptation]）。
+    ///
+    /// 输入是解码层报告的 cam_mul——两个比值都能从它直接算，无需额外查表。
+    pub fn with_wb_adaptation(mut self, cam_mul: [f32; 3]) -> Self {
+        let g = wb_adaptation(
+            (cam_mul[0] / cam_mul[1]) as f64,
+            (cam_mul[2] / cam_mul[1]) as f64,
+        );
+        self.wb_gain = [g[0] as f32, g[1] as f32, g[2] as f32];
+        self
+    }
+
+    /// 当前的逐通道增益，供报告与自检。
+    pub fn wb_gain(&self) -> [f32; 3] {
+        self.wb_gain
     }
 
     /// 对整幅图像施加。输出为行主序的三通道 `f32`。
